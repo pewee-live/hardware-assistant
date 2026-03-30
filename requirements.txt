@@ -1,0 +1,6 @@
+langgraph
+langchain-core
+langchain-openai
+paramiko
+pyserial
+python-dotenv
