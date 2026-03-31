@@ -100,6 +100,29 @@ python main.py
 ```
 按照终端提示输入 `ssh root@192.168.1.50 22` 或 `serial COM3 115200` 即可连接并开始问答。
 
+#### 方案 C：使用 Docker 部署运行（全平台支持）
+
+本项目现已完美接入 Docker，支持通过 Github Actions 打包并推送到 DockerHub（同时兼容 `amd64` / `arm64` 架构）。这使得你在软路由、NAS、树莓派等设备上可以一键无缝部署。
+
+1. **直接拉取并运行已有镜像**（请将 `<your_dockerhub_username>` 替换为实际拉取的用户名）：
+```bash
+docker run -d --name ssh-helper \
+  -p 8000:8000 \
+  -e DEEPSEEK_API_KEY=your_super_secret_api_key_here \
+  pewee/sshhelper:latest
+```
+运行后访问：`http://localhost:8000/`
+
+2. **如果需要使用本地串口 (Serial) 功能**：在启动时需要增加设备映射隧道 (`--device`)，以便让容器内部可以接触到底层宿主机的 USB 串口！举个例子（Linux宿主机下）：
+```bash
+docker run -d --name ssh-helper \
+  -p 8000:8000 \
+  -e DEEPSEEK_API_KEY=your_key \
+  --device=/dev/ttyUSB0 \
+  pewee/sshhelper:latest
+```
+*(注：由于 Docker 引擎的隔离限制机制，Windows系统运行的 Docker Desktop 不支持原生的串口/USB 透传。需要串口功能的 Windows 用户请参考 方案A 原生运行。)*
+
 ---
 
 ## 扩展与自定义
