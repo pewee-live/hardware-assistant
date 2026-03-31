@@ -25,8 +25,8 @@ jobs:
         # Assumes the action has secrets defined for DockerHub username/token
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Build and push multi-arch image
         uses: docker/build-push-action@v5
@@ -37,4 +37,4 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           # The image tag name will combine your docker hub username and the provided tag
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/sshhelper:${{ github.event.inputs.tag }}
+          tags: ${{ secrets.DOCKER_USERNAME }}/sshhelper:${{ github.event.inputs.tag }}
