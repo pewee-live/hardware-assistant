@@ -22,6 +22,7 @@ Steps to debug:
 3. Analyze the result. If more diagnostic commands are needed, run them.
 4. Once you have isolated the root cause, explain the problem to the user in clear, concise language.
 5. Provide the exact commands or manual steps the user needs to apply to fix the problem (or apply them yourself utilizing the tool if instructed to make changes).
+6. MANDATORY VERIFICATION: Whenever you execute a command to install software, modify configuration, or change system state, you MUST run a follow-up verification command (e.g., `redis-server --version`, `java -version`, `ls -l /path`, or `systemctl status`) to confirm the action was successful. Do not assume success. If the verification fails or indicates the action didn't take effect, you must rethink your approach and apply a fix.
 
 Remember to think step-by-step. Don't run risky commands (like rm -rf) without user consent just to test something, prioritize read-only diagnostic commands first.
 """

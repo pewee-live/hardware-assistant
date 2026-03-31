@@ -2,7 +2,19 @@ import time
 import paramiko
 import serial
 from typing import Optional
+from getpass import getpass
 from langchain_core.tools import tool
+
+# Dictionary/List of password prompt keywords (English and Chinese)
+# Users can add more keywords here as needed
+PASSWORD_PROMPT_KEYWORDS = [
+    "password:",
+    "Password:",
+    "password for",
+    "Password for",
+    "密码",
+    "Enter PIN"
+]
 
 class ConnectionManager:
     """Manages the active hardware connection (SSH or Serial)."""
@@ -26,17 +38,60 @@ class ConnectionManager:
 
     def execute(self, command: str) -> str:
         if self.conn_type == "ssh" and self.ssh_client:
-            stdin, stdout, stderr = self.ssh_client.exec_command(command)
-            out = stdout.read().decode('utf-8')
-            err = stderr.read().decode('utf-8')
+            # get_pty=True allows commands like sudo to prompt for a password interactively
+            stdin, stdout, stderr = self.ssh_client.exec_command(command, get_pty=True)
+            channel = stdout.channel
             
-            result = ""
-            if out:
-                result += f"STDOUT:\\n{out}\\n"
-            if err:
-                result += f"STDERR:\\n{err}\\n"
-            if not result.strip():
-                result = "Command executed successfully, but produced no output."
+            output = ""
+            buffer = ""
+            
+            print(f"\n--- Executing SSH Command: {command} ---")
+            
+            while True:
+                got_data = False
+                
+                if channel.recv_ready():
+                    chunk_bytes = channel.recv(1024)
+                    if chunk_bytes:
+                        chunk = chunk_bytes.decode('utf-8', errors='replace')
+                        output += chunk
+                        buffer += chunk
+                        got_data = True
+                        print(chunk, end='', flush=True)
+                
+                if channel.recv_stderr_ready():
+                    chunk_bytes = channel.recv_stderr(1024)
+                    if chunk_bytes:
+                        chunk = chunk_bytes.decode('utf-8', errors='replace')
+                        output += chunk
+                        buffer += chunk
+                        got_data = True
+                        print(chunk, end='', flush=True)
+                
+                # If command has exited and there is no more data to read, we are done
+                if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+                    break
+                
+                if not got_data:
+                    # Stream is paused, check if the last line waits for a password
+                    last_line = buffer.split('\n')[-1]
+                    if any(kw in last_line for kw in PASSWORD_PROMPT_KEYWORDS):
+                        pwd = getpass("\n[Agent] Remote system is asking for a password. Please enter it: ")
+                        # Send password directly into the channel to bypass python file buffering
+                        channel.sendall((pwd + '\n').encode('utf-8'))
+                        # Clear buffer so we don't prompt again for the same line
+                        buffer = ""
+                    else:
+                        time.sleep(0.1)
+                        
+            exit_status = channel.recv_exit_status()
+            print("\n--- Command Finished ---")
+            
+            result = f"Exit Status: {exit_status}\n"
+            if output:
+                result += f"OUTPUT:\n{output}\n"
+            if not output.strip():
+                result += "Command executed successfully, but produced no output."
             return result
             
         elif self.conn_type == "serial" and self.serial_client:
@@ -45,18 +100,37 @@ class ConnectionManager:
             # Send command
             cmd_bytes = f"{command}\r\n".encode('utf-8')
             self.serial_client.write(cmd_bytes)
+            # Read continuously until 2 seconds of inactivity
+            print(f"\n--- Executing Serial Command: {command} ---")
+            output = ""
+            buffer = ""
+            idle_time = 0.0
             
-            # Read response
-            time.sleep(0.5) # Wait for device to respond
-            response = []
-            while self.serial_client.in_waiting > 0:
-                try:
-                    line = self.serial_client.readline().decode('utf-8', errors='replace')
-                    response.append(line.rstrip('\\r\\n'))
-                except Exception as e:
-                    response.append(f"[Error reading partial output: {e}]")
+            while idle_time < 2.0:
+                if self.serial_client.in_waiting > 0:
+                    idle_time = 0.0
+                    try:
+                        chunk = self.serial_client.read(self.serial_client.in_waiting).decode('utf-8', errors='replace')
+                        output += chunk
+                        buffer += chunk
+                        print(chunk, end='', flush=True)
+                    except Exception as e:
+                        err_msg = f"\n[Error reading partial output: {e}]\n"
+                        output += err_msg
+                        print(err_msg, end='', flush=True)
+                else:
+                    last_line = buffer.split('\n')[-1]
+                    if any(kw in last_line for kw in PASSWORD_PROMPT_KEYWORDS):
+                        pwd = getpass("\n[Agent] Serial device is asking for a password. Please enter it: ")
+                        self.serial_client.write(f"{pwd}\r\n".encode('utf-8'))
+                        buffer = ""
+                        idle_time = 0.0
+                    
+                    time.sleep(0.1)
+                    idle_time += 0.1
             
-            return "\\n".join(response) if response else "Command executed, but no output was returned."
+            print("\n--- Command Finished ---")
+            return f"OUTPUT:\n{output}\n" if output.strip() else "Command executed successfully, but produced no output."
         else:
             return "Error: No active connection. Please ensure the agent is connected first."
 
