@@ -4,3 +4,6 @@ langchain-openai
 paramiko
 pyserial
 python-dotenv
+fastapi
+uvicorn
+websockets

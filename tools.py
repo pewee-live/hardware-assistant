@@ -24,6 +24,10 @@ class ConnectionManager:
         self.ssh_client: Optional[paramiko.SSHClient] = None
         self.serial_client: Optional[serial.Serial] = None
         
+        # Callbacks that can be overridden by the Web server
+        self.on_output = lambda text: print(text, end='', flush=True)
+        self.on_password_request = lambda prompt: getpass(prompt)
+        
     def connect_ssh(self, host: str, username: str, password: Optional[str] = None, port: int = 22):
         self.conn_type = "ssh"
         self.ssh_client = paramiko.SSHClient()
@@ -37,6 +41,16 @@ class ConnectionManager:
         return f"Successfully connected to Serial port {port} at {baudrate} baud."
 
     def execute(self, command: str) -> str:
+        # --- Safety Firewall ---
+        # Prevent the LLM from blindly running full-screen interactive CLI apps
+        # that would trap our PTY terminal in an infinite display loop.
+        tokens = set(command.split())
+        interactive_tools = {"htop", "vi", "vim", "nano", "ncdu", "tmux", "screen", "minicom"}
+        forbidden_intersections = tokens.intersection(interactive_tools)
+        if forbidden_intersections:
+            blocked_apps = ", ".join(forbidden_intersections)
+            return f"Error: Command rejected by safety firewall. '{blocked_apps}' is an interactive/full-screen program which causes terminal deadlocks. Please use non-interactive alternatives (e.g., 'cat', 'sed -i', 'top -b -n 1')."
+
         if self.conn_type == "ssh" and self.ssh_client:
             # get_pty=True allows commands like sudo to prompt for a password interactively
             stdin, stdout, stderr = self.ssh_client.exec_command(command, get_pty=True)
@@ -45,7 +59,7 @@ class ConnectionManager:
             output = ""
             buffer = ""
             
-            print(f"\n--- Executing SSH Command: {command} ---")
+            self.on_output(f"\n--- Executing SSH Command: {command} ---\n")
             
             while True:
                 got_data = False
@@ -57,7 +71,7 @@ class ConnectionManager:
                         output += chunk
                         buffer += chunk
                         got_data = True
-                        print(chunk, end='', flush=True)
+                        self.on_output(chunk)
                 
                 if channel.recv_stderr_ready():
                     chunk_bytes = channel.recv_stderr(1024)
@@ -66,7 +80,7 @@ class ConnectionManager:
                         output += chunk
                         buffer += chunk
                         got_data = True
-                        print(chunk, end='', flush=True)
+                        self.on_output(chunk)
                 
                 # If command has exited and there is no more data to read, we are done
                 if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
@@ -76,16 +90,21 @@ class ConnectionManager:
                     # Stream is paused, check if the last line waits for a password
                     last_line = buffer.split('\n')[-1]
                     if any(kw in last_line for kw in PASSWORD_PROMPT_KEYWORDS):
-                        pwd = getpass("\n[Agent] Remote system is asking for a password. Please enter it: ")
+                        pwd = self.on_password_request("\n[Agent] Remote system is asking for a password. Please enter it: ")
                         # Send password directly into the channel to bypass python file buffering
                         channel.sendall((pwd + '\n').encode('utf-8'))
                         # Clear buffer so we don't prompt again for the same line
                         buffer = ""
+                    elif "(END)" in last_line:
+                        # Pager has reached the end and is waiting for 'q'
+                        channel.sendall(b'q\n')
+                        buffer = ""
+                        self.on_output("\n[Agent] Detected interactive pager, automatically sending 'q' to exit...\n")
                     else:
                         time.sleep(0.1)
                         
             exit_status = channel.recv_exit_status()
-            print("\n--- Command Finished ---")
+            self.on_output("\n--- Command Finished ---\n")
             
             result = f"Exit Status: {exit_status}\n"
             if output:
@@ -101,7 +120,7 @@ class ConnectionManager:
             cmd_bytes = f"{command}\r\n".encode('utf-8')
             self.serial_client.write(cmd_bytes)
             # Read continuously until 2 seconds of inactivity
-            print(f"\n--- Executing Serial Command: {command} ---")
+            self.on_output(f"\n--- Executing Serial Command: {command} ---\n")
             output = ""
             buffer = ""
             idle_time = 0.0
@@ -113,23 +132,29 @@ class ConnectionManager:
                         chunk = self.serial_client.read(self.serial_client.in_waiting).decode('utf-8', errors='replace')
                         output += chunk
                         buffer += chunk
-                        print(chunk, end='', flush=True)
+                        self.on_output(chunk)
                     except Exception as e:
                         err_msg = f"\n[Error reading partial output: {e}]\n"
                         output += err_msg
-                        print(err_msg, end='', flush=True)
+                        self.on_output(err_msg)
                 else:
                     last_line = buffer.split('\n')[-1]
                     if any(kw in last_line for kw in PASSWORD_PROMPT_KEYWORDS):
-                        pwd = getpass("\n[Agent] Serial device is asking for a password. Please enter it: ")
+                        pwd = self.on_password_request("\n[Agent] Serial device is asking for a password. Please enter it: ")
                         self.serial_client.write(f"{pwd}\r\n".encode('utf-8'))
                         buffer = ""
                         idle_time = 0.0
+                    elif "(END)" in last_line:
+                        # Pager has reached the end
+                        self.serial_client.write(b'q\r\n')
+                        buffer = ""
+                        idle_time = 0.0
+                        self.on_output("\n[Agent] Detected interactive pager, automatically sending 'q' to exit...\n")
                     
                     time.sleep(0.1)
                     idle_time += 0.1
             
-            print("\n--- Command Finished ---")
+            self.on_output("\n--- Command Finished ---\n")
             return f"OUTPUT:\n{output}\n" if output.strip() else "Command executed successfully, but produced no output."
         else:
             return "Error: No active connection. Please ensure the agent is connected first."

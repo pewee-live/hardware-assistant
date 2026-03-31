@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hardware Debugging Agent</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <aside class="sidebar glass-panel">
+            <h2>Connection</h2>
+            <div class="tabs">
+                <button class="tab-btn active" data-type="ssh">SSH</button>
+                <button class="tab-btn" data-type="serial">Serial</button>
+            </div>
+            
+            <form id="connect-form" class="active-form">
+                <!-- SSH Form -->
+                <div id="ssh-fields" class="form-fields ssh-fields active">
+                    <input type="text" id="ssh-host" placeholder="Host IP (e.g. 192.168.1.1)" required>
+                    <input type="text" id="ssh-username" placeholder="Username" required>
+                    <input type="password" id="ssh-password" placeholder="Password (Optional)">
+                    <input type="number" id="ssh-port" placeholder="Port" value="22" required>
+                </div>
+                <!-- Serial Form -->
+                <div id="serial-fields" class="form-fields serial-fields" style="display: none;">
+                    <input type="text" id="serial-port" placeholder="COM Port / dev/tty">
+                    <input type="number" id="serial-baudrate" placeholder="Baudrate" value="115200">
+                </div>
+                
+                <button type="submit" class="btn primary-btn" id="connect-btn">Connect</button>
+            </form>
+            <div id="conn-status" class="status-indicator">Disconnected</div>
+        </aside>
+
+        <!-- Main Chat Area -->
+        <main class="chat-area">
+            <header class="chat-header glass-panel">
+                <h1>Hardware Agent Console</h1>
+                <span id="agent-status" class="badge idle">Ready</span>
+            </header>
+            
+            <div class="message-feed" id="message-feed">
+                <div class="welcome-message">
+                    Welcome. Connect to a device to begin debugging.
+                </div>
+            </div>
+            
+            <div class="chat-input-area glass-panel">
+                <form id="chat-form">
+                    <input type="text" id="chat-input" placeholder="Describe your hardware issue..." autocomplete="off" disabled>
+                    <button type="submit" id="send-btn" class="btn primary-btn" disabled>Send</button>
+                </form>
+            </div>
+        </main>
+    </div>
+
+    <!-- Password Modal -->
+    <div id="password-modal" class="modal-overlay">
+        <div class="modal glass-panel">
+            <h3>🔑 Authentication Required</h3>
+            <p id="password-prompt-text">The remote system is requesting a password:</p>
+            <form id="password-form">
+                <input type="password" id="modal-password" placeholder="Enter password" autocomplete="off" required>
+                <button type="submit" class="btn danger-btn">Submit</button>
+            </form>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
