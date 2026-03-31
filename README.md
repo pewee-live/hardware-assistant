@@ -109,7 +109,7 @@ python main.py
 docker run -d --name ssh-helper \
   -p 8000:8000 \
   -e DEEPSEEK_API_KEY=your_super_secret_api_key_here \
-  pewee/sshhelper:latest
+  peweelive/sshhelper:latest
 ```
 运行后访问：`http://localhost:8000/`
 
@@ -119,7 +119,7 @@ docker run -d --name ssh-helper \
   -p 8000:8000 \
   -e DEEPSEEK_API_KEY=your_key \
   --device=/dev/ttyUSB0 \
-  pewee/sshhelper:latest
+  peweelive/sshhelper:latest
 ```
 *(注：由于 Docker 引擎的隔离限制机制，Windows系统运行的 Docker Desktop 不支持原生的串口/USB 透传。需要串口功能的 Windows 用户请参考 方案A 原生运行。)*
 
