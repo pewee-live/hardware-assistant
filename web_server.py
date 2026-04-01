@@ -90,6 +90,31 @@ def startup_event():
         print(f"Agent failed to build: {e}")
         print("Ensure DEEPSEEK_API_KEY is configured in .env")
 
+@app.get("/api/status")
+async def get_status():
+    status = {"connected": False}
+    if DEVICE_MANAGER.conn_type == "ssh" and getattr(DEVICE_MANAGER, 'ssh_client', None):
+        try:
+            host = DEVICE_MANAGER.ssh_client.get_transport().getpeername()[0]
+        except:
+            host = "Unknown"
+        status.update({"connected": True, "conn_type": "ssh", "message": f"Connected to SSH at {host}"})
+    elif DEVICE_MANAGER.conn_type == "serial" and getattr(DEVICE_MANAGER, 'serial_client', None):
+        status.update({"connected": True, "conn_type": "serial", "message": f"Connected to Serial port {DEVICE_MANAGER.serial_client.port}"})
+    
+    # Restore chat history
+    history = []
+    for m in messages:
+        if isinstance(m, HumanMessage):
+            history.append({"type": "user_message", "content": m.content})
+        elif hasattr(m, 'tool_calls') and m.tool_calls:
+            for tc in m.tool_calls:
+                history.append({"type": "tool_call", "name": tc["name"], "args": tc["args"]})
+        elif getattr(m, 'content', None):
+            history.append({"type": "agent_message", "content": m.content})
+    status["history"] = history
+    return status
+
 @app.post("/api/connect")
 async def connect(req: ConnectRequest):
     try:
@@ -100,6 +125,14 @@ async def connect(req: ConnectRequest):
         else:
             return {"status": "error", "message": "Unknown conn_type"}
         return {"status": "success", "message": msg}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/disconnect")
+async def disconnect_hardware():
+    try:
+        DEVICE_MANAGER.disconnect()
+        return {"status": "success", "message": "Disconnected"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

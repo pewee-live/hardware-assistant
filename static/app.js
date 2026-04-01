@@ -5,6 +5,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const serialFields = document.getElementById('serial-fields');
     const connectForm = document.getElementById('connect-form');
     const connectBtn = document.getElementById('connect-btn');
+    const disconnectBtn = document.getElementById('disconnect-btn');
     const connStatus = document.getElementById('conn-status');
     
     const chatInput = document.getElementById('chat-input');
@@ -45,6 +46,37 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
     });
+
+    // --- Check if connection already exists ---
+    async function checkExistingConnection() {
+        try {
+            // Add cache: 'no-store' to prevent browser returning stale cached network requests on fast F5
+            const res = await fetch('/api/status', { cache: 'no-store' });
+            const data = await res.json();
+            if (data.connected) {
+                connStatus.textContent = "✔ " + data.message;
+                connStatus.className = 'status-indicator connected';
+                currentConnType = data.conn_type;
+                initWebSocket();
+                
+                // Clear the welcome message if there is history
+                if (data.history && data.history.length > 0) {
+                    const existingWelcome = document.querySelector('.welcome-message');
+                    if (existingWelcome) existingWelcome.remove();
+                    data.history.forEach(msg => handleAgentMessage(msg));
+                }
+                
+                tabBtns.forEach(btn => {
+                    if (btn.dataset.type === currentConnType) {
+                        btn.click();
+                    }
+                });
+            }
+        } catch (e) {
+            console.error("Status check failed:", e);
+        }
+    }
+    checkExistingConnection();
 
     // Connection Form
     connectForm.addEventListener('submit', async (e) => {
@@ -91,6 +123,24 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
+    // Disconnect Action
+    disconnectBtn.addEventListener('click', async () => {
+        try {
+            await fetch('/api/disconnect', { method: 'POST' });
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.close();
+            } else {
+                connStatus.textContent = 'Disconnected';
+                connStatus.className = 'status-indicator';
+                connectForm.querySelectorAll('input').forEach(i => i.disabled = false);
+                connectBtn.style.display = 'block';
+                disconnectBtn.style.display = 'none';
+            }
+        } catch (e) {
+            console.error("Disconnect API failed", e);
+        }
+    });
+
     // Chat WebSocket
     function initWebSocket() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -101,6 +151,7 @@ document.addEventListener('DOMContentLoaded', () => {
             sendBtn.disabled = false;
             connectForm.querySelectorAll('input').forEach(i => i.disabled = true);
             connectBtn.style.display = 'none';
+            disconnectBtn.style.display = 'block';
             chatInput.focus();
         };
 
@@ -114,6 +165,9 @@ document.addEventListener('DOMContentLoaded', () => {
             connStatus.className = 'status-indicator';
             chatInput.disabled = true;
             sendBtn.disabled = true;
+            connectForm.querySelectorAll('input').forEach(i => i.disabled = false);
+            connectBtn.style.display = 'block';
+            disconnectBtn.style.display = 'none';
             ws = null;
         };
     }

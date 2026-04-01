@@ -40,6 +40,16 @@ class ConnectionManager:
         self.serial_client = serial.Serial(port=port, baudrate=baudrate, timeout=3)
         return f"Successfully connected to Serial port {port} at {baudrate} baud."
 
+    def disconnect(self):
+        if getattr(self, 'conn_type', None) == "ssh" and getattr(self, 'ssh_client', None):
+            self.ssh_client.close()
+            self.ssh_client = None
+        elif getattr(self, 'conn_type', None) == "serial" and getattr(self, 'serial_client', None):
+            self.serial_client.close()
+            self.serial_client = None
+        self.conn_type = None
+        return "Disconnected successfully."
+
     def execute(self, command: str) -> str:
         # --- Safety Firewall ---
         # Prevent the LLM from blindly running full-screen interactive CLI apps

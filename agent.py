@@ -7,8 +7,10 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from llm import get_llm
 from tools import execute_device_command
 
+
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
+
 
 # Define the system prompt
 SYSTEM_PROMPT = """You are an expert hardware debugging assistant.
@@ -28,33 +30,34 @@ Steps to debug:
 Remember to think step-by-step. Don't run risky commands (like rm -rf) without user consent just to test something, prioritize read-only diagnostic commands first.
 """
 
+
 def build_hardware_agent():
     llm = get_llm()
     # Bind the execute function to the LLM
     tools = [execute_device_command]
     llm_with_tools = llm.bind_tools(tools)
-    
+
     # We define the node function for the agent
     def agent_node(state: AgentState):
         messages = state["messages"]
         # Make sure system prompt is at the beginning if not already there,
         # but the standard way is to insert it or rely on the user to append it to state.
         # We will prepend it temporarily for this call if it's not the first msg or we'll assume it's there.
-        # Actually, let's keep it simple: we just pass state to the LLM. 
+        # Actually, let's keep it simple: we just pass state to the LLM.
         # But we want the system prompt.
         if not any(isinstance(m, SystemMessage) for m in messages):
             messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(messages)
-            
+
         response = llm_with_tools.invoke(messages)
         return {"messages": [response]}
-        
+
     # Build Graph
     workflow = StateGraph(AgentState)
-    
+
     # Add Nodes
     workflow.add_node("agent", agent_node)
     workflow.add_node("tools", ToolNode(tools))
-    
+
     # Add Edges
     workflow.add_edge(START, "agent")
     workflow.add_conditional_edges(
@@ -62,5 +65,5 @@ def build_hardware_agent():
         tools_condition,
     )
     workflow.add_edge("tools", "agent")
-    
+
     return workflow.compile()

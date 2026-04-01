@@ -136,6 +136,27 @@ input:disabled {
     transform: scale(0.97);
 }
 
+.disconnect-btn {
+    width: 100%;
+    padding: 0.8rem 1rem;
+    border: 1px solid var(--danger-color);
+    background: rgba(239, 68, 68, 0.1);
+    color: #f87171;
+    border-radius: 8px;
+    font-size: 0.95rem;
+    cursor: pointer;
+    font-family: inherit;
+    font-weight: 600;
+    transition: all 0.3s ease;
+    margin-top: 0.5rem;
+    display: none;
+}
+
+.disconnect-btn:hover {
+    background: var(--danger-color);
+    color: white;
+}
+
 .primary-btn {
     background: linear-gradient(135deg, var(--primary-color), var(--primary-hover));
     box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
@@ -262,6 +283,7 @@ input:disabled {
     animation: slideIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
     line-height: 1.5;
     font-size: 0.95rem;
+    flex-shrink: 0;
 }
 
 @keyframes slideIn {
@@ -326,6 +348,9 @@ input:disabled {
     align-self: center;
     margin: 0.5rem 0;
     overflow-x: auto;
+    overflow-y: auto;
+    max-height: 500px;
+    flex-shrink: 0;
     border: 1px solid rgba(255,255,255,0.08);
     box-shadow: inset 0 2px 8px rgba(0,0,0,0.5);
 }
