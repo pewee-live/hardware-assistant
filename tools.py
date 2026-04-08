@@ -60,6 +60,9 @@ class ConnectionManager:
         if forbidden_intersections:
             blocked_apps = ", ".join(forbidden_intersections)
             return f"Error: Command rejected by safety firewall. '{blocked_apps}' is an interactive/full-screen program which causes terminal deadlocks. Please use non-interactive alternatives (e.g., 'cat', 'sed -i', 'top -b -n 1')."
+            
+        if "sensors-detect" in command and "--auto" not in command:
+            return "Error: Command rejected by safety firewall. 'sensors-detect' is interactive and will wait for user input indefinitely, causing the agent to hang. Please use 'sensors-detect --auto' instead."
 
         if self.conn_type == "ssh" and self.ssh_client:
             # get_pty=True allows commands like sudo to prompt for a password interactively

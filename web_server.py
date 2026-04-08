@@ -177,7 +177,7 @@ async def websocket_endpoint(ws: WebSocket):
                                     "type": "agent_message", 
                                     "content": msg.content
                                 })
-                        elif node_name == "tools":
+                        elif node_name in ["tools", "invalid_tools"]:
                             await ws.send_json({"type": "status", "content": "Tool execution finished. Agent processing results..."})
                         
                         # Accumulate context

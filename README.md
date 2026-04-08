@@ -17,6 +17,7 @@
 6. **闭环指令验证**：约束模型在对系统进行状态更改（如安装软件、修改系统配置）后，强制去执行相关的二次验证操作（如检查进程状态或获取版本号），自动防范执行失败导致的伪成功反馈。
 7. **高级 Web UI**：内置基于 FastAPI 和 WebSockets 的图形化页面，提供暗黑主题玻璃拟态界面、终端打字机效果输出以及直观的思考过程展示。
 8. **交互死锁防火墙**：在底层流处理与 Agent 认知级别双重设防，自动拦截或处理诸如 `htop`、`vim`、`less` 等会导致 PTY 终端永久挂起的命令。
+9. **非法调用自我修正 (Self-Correction)**：新增对模型输出错误 JSON 或格式破坏的识别隔离节点 `invalid_tools`，原生捕获非法请求并流转回主代理，强制模型重新反思修正，彻底避免因上下文状态缺失导致的 API Error 400 中断异常。
 
 ---
 
@@ -27,8 +28,10 @@
 ```mermaid
 stateDiagram-v2
     [*] --> agent
-    agent --> tools: LLM判断需要执行工具时 (tools_condition)
+    agent --> tools: LLM判断需要执行工具时
+    agent --> invalid_tools: LLM输出格式错误的工具调用时 
     tools --> agent: 将终端输出信息返回大模型
+    invalid_tools --> agent: 将格式报错返回大模型要求修正
     agent --> [*]: 对话完成或给出最终排查结果 (END)
 ```
 

@@ -1,8 +1,8 @@
 import operator
 from typing import Annotated, TypedDict, Sequence
-from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.messages import BaseMessage, SystemMessage, ToolMessage
 from langgraph.graph import StateGraph, START
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
 
 from llm import get_llm
 from tools import execute_device_command
@@ -26,6 +26,7 @@ Steps to debug:
 5. Provide the exact commands or manual steps the user needs to apply to fix the problem (or apply them yourself utilizing the tool if instructed to make changes).
 6. MANDATORY VERIFICATION: Whenever you execute a command to install software, modify configuration, or change system state, you MUST run a follow-up verification command (e.g., `redis-server --version`, `java -version`, `ls -l /path`, or `systemctl status`) to confirm the action was successful. Do not assume success. If the verification fails or indicates the action didn't take effect, you must rethink your approach and apply a fix.
 7. AVOID INTERACTIVE PAGERS: Terminal outputs using `less`, `more`, or commands like `systemctl status`, `git log`, `journalctl` will open interactive pagers waiting for user keyboard input (like pressing 'q'), which WILL CAUSE THE AGENT TO HANG FOREVER since it cannot press 'q'. You MUST append ` --no-pager`, or pipe the output to `cat` (e.g., `systemctl status X --no-pager` or `dmesg | cat`) for any command that might paginate. Do not use `less` or `vim`, use `cat` or `sed` instead.
+8. AVOID INTERACTIVE PROMPTS: Any command that stops and waits for a "YES/NO" or "Hit Enter" user prompt (like `apt-get install`, `fdisk`, `sensors-detect`) will hang the agent forever. You MUST use non-interactive flags provided by the tools themselves (e.g., `apt-get install -y`, `sensors-detect --auto`, `echo -e "\n" | command`) to bypass these prompts.
 
 Remember to think step-by-step. Don't run risky commands (like rm -rf) without user consent just to test something, prioritize read-only diagnostic commands first.
 """
@@ -51,19 +52,43 @@ def build_hardware_agent():
         response = llm_with_tools.invoke(messages)
         return {"messages": [response]}
 
+    def invalid_tools_node(state: AgentState):
+        messages = state["messages"]
+        last_message = messages[-1]
+        new_messages = []
+        if hasattr(last_message, "invalid_tool_calls"):
+            for tc in last_message.invalid_tool_calls:
+                new_messages.append(ToolMessage(
+                    content=f"Error: Invalid tool call. Details: {tc.get('error', 'Malformed arguments')}",
+                    name=tc.get("name", "unknown_tool"),
+                    tool_call_id=tc.get("id", "unknown_id")
+                ))
+        return {"messages": new_messages}
+
+    def custom_tools_condition(state: AgentState):
+        messages = state["messages"]
+        last_message = messages[-1]
+        if hasattr(last_message, "tool_calls") and len(last_message.tool_calls) > 0:
+            return "tools"
+        if hasattr(last_message, "invalid_tool_calls") and len(last_message.invalid_tool_calls) > 0:
+            return "invalid_tools"
+        return "__end__"
+
     # Build Graph
     workflow = StateGraph(AgentState)
 
     # Add Nodes
     workflow.add_node("agent", agent_node)
     workflow.add_node("tools", ToolNode(tools))
+    workflow.add_node("invalid_tools", invalid_tools_node)
 
     # Add Edges
     workflow.add_edge(START, "agent")
     workflow.add_conditional_edges(
         "agent",
-        tools_condition,
+        custom_tools_condition,
     )
     workflow.add_edge("tools", "agent")
+    workflow.add_edge("invalid_tools", "agent")
 
     return workflow.compile()

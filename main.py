@@ -105,7 +105,7 @@ def main():
                                 print(f"-> Agent executing tool: {tc['name']} with args: {tc['args']}")
                         else:
                             print(f"Agent: {msg.content}")
-                    elif node_name == "tools":
+                    elif node_name in ["tools", "invalid_tools"]:
                         print("-> Tool execution finished. Agent processing results...")
                         
                 # Update our final state from the event stream to preserve context
