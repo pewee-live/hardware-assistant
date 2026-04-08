@@ -13,7 +13,11 @@ PASSWORD_PROMPT_KEYWORDS = [
     "password for",
     "Password for",
     "密码",
-    "Enter PIN"
+    "Enter PIN",
+    "Username for",
+    "username for",
+    "Username:",
+    "username:"
 ]
 
 class ConnectionManager:
@@ -103,7 +107,7 @@ class ConnectionManager:
                     # Stream is paused, check if the last line waits for a password
                     last_line = buffer.split('\n')[-1]
                     if any(kw in last_line for kw in PASSWORD_PROMPT_KEYWORDS):
-                        pwd = self.on_password_request("\n[Agent] Remote system is asking for a password. Please enter it: ")
+                        pwd = self.on_password_request("\n[Agent] Remote system is asking for input (password/username). Please enter it: ")
                         # Send password directly into the channel to bypass python file buffering
                         channel.sendall((pwd + '\n').encode('utf-8'))
                         # Clear buffer so we don't prompt again for the same line
@@ -153,7 +157,7 @@ class ConnectionManager:
                 else:
                     last_line = buffer.split('\n')[-1]
                     if any(kw in last_line for kw in PASSWORD_PROMPT_KEYWORDS):
-                        pwd = self.on_password_request("\n[Agent] Serial device is asking for a password. Please enter it: ")
+                        pwd = self.on_password_request("\n[Agent] Serial device is asking for input (password/username). Please enter it: ")
                         self.serial_client.write(f"{pwd}\r\n".encode('utf-8'))
                         buffer = ""
                         idle_time = 0.0
