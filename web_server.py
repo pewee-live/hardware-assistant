@@ -161,7 +161,8 @@ async def websocket_endpoint(ws: WebSocket):
             
             try:
                 # astream handles async execution, running tools in background threads
-                async for event in agent_app.astream({"messages": messages}):
+                config = {"recursion_limit": 150}
+                async for event in agent_app.astream({"messages": messages}, config=config):
                     for node_name, node_state in event.items():
                         if node_name == "agent":
                             msg = node_state["messages"][-1]

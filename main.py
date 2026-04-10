@@ -95,8 +95,9 @@ def main():
             messages.append(HumanMessage(content=user_input))
             
             # Print streaming output
-            print("\\nAgent Thinking...")
-            for event in app.stream({"messages": messages}):
+            print("\nAgent Thinking...")
+            config = {"recursion_limit": 150}
+            for event in app.stream({"messages": messages}, config=config):
                 for node_name, node_state in event.items():
                     if node_name == "agent":
                         msg = node_state["messages"][-1]
