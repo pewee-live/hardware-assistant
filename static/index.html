@@ -19,29 +19,35 @@
             
             <hr style="border: 0; border-top: 1px solid var(--glass-border); margin: 1rem 0;">
             
-            <h2>Connection</h2>
-            <div class="tabs">
-                <button class="tab-btn active" data-type="ssh">SSH</button>
-                <button class="tab-btn" data-type="serial">Serial</button>
+            <div class="connection-header" id="conn-toggle-header" style="display: flex; justify-content: space-between; align-items: center; cursor: pointer; user-select: none;">
+                <h2>Connection</h2>
+                <span id="conn-toggle-icon" style="transition: transform 0.3s; font-size: 1.2rem;">▼</span>
             </div>
             
-            <form id="connect-form" class="active-form">
-                <!-- SSH Form -->
-                <div id="ssh-fields" class="form-fields ssh-fields active">
-                    <input type="text" id="ssh-host" placeholder="Host IP (e.g. 192.168.1.1)" required>
-                    <input type="text" id="ssh-username" placeholder="Username" required>
-                    <input type="password" id="ssh-password" placeholder="Password (Optional)">
-                    <input type="number" id="ssh-port" placeholder="Port" value="22" required>
-                </div>
-                <!-- Serial Form -->
-                <div id="serial-fields" class="form-fields serial-fields" style="display: none;">
-                    <input type="text" id="serial-port" placeholder="COM Port / dev/tty">
-                    <input type="number" id="serial-baudrate" placeholder="Baudrate" value="115200">
+            <div id="connection-wrapper" class="connection-wrapper">
+                <div class="tabs">
+                    <button class="tab-btn active" data-type="ssh">SSH</button>
+                    <button class="tab-btn" data-type="serial">Serial</button>
                 </div>
                 
-                <button type="submit" class="btn primary-btn" id="connect-btn">Connect</button>
-            </form>
-            <button id="disconnect-btn" class="disconnect-btn">Disconnect from Device</button>
+                <form id="connect-form" class="active-form">
+                    <!-- SSH Form -->
+                    <div id="ssh-fields" class="form-fields ssh-fields active">
+                        <input type="text" id="ssh-host" placeholder="Host IP (e.g. 192.168.1.1)" required>
+                        <input type="text" id="ssh-username" placeholder="Username" required>
+                        <input type="password" id="ssh-password" placeholder="Password (Optional)">
+                        <input type="number" id="ssh-port" placeholder="Port" value="22" required>
+                    </div>
+                    <!-- Serial Form -->
+                    <div id="serial-fields" class="form-fields serial-fields" style="display: none;">
+                        <input type="text" id="serial-port" placeholder="COM Port / dev/tty">
+                        <input type="number" id="serial-baudrate" placeholder="Baudrate" value="115200">
+                    </div>
+                    
+                    <button type="submit" class="btn primary-btn" id="connect-btn">Connect</button>
+                </form>
+                <button id="disconnect-btn" class="disconnect-btn">Disconnect from Device</button>
+            </div>
             <div id="conn-status" class="status-indicator">Disconnected</div>
         </aside>
 

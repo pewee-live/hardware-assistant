@@ -23,6 +23,20 @@ document.addEventListener('DOMContentLoaded', () => {
     const sessionList = document.getElementById('session-list');
     const newChatBtn = document.getElementById('new-chat-btn');
 
+    const connToggleHeader = document.getElementById('conn-toggle-header');
+    const connectionWrapper = document.getElementById('connection-wrapper');
+    const connToggleIcon = document.getElementById('conn-toggle-icon');
+
+    // Toggle connection settings
+    connToggleHeader.addEventListener('click', () => {
+        connectionWrapper.classList.toggle('collapsed');
+        if (connectionWrapper.classList.contains('collapsed')) {
+            connToggleIcon.style.transform = 'rotate(-90deg)';
+        } else {
+            connToggleIcon.style.transform = 'rotate(0deg)';
+        }
+    });
+
     let currentConnType = 'ssh';
     let ws = null;
     let currentTerminalBlock = null;
@@ -224,6 +238,12 @@ document.addEventListener('DOMContentLoaded', () => {
                     chatTitle.textContent = sData.session.name;
                     loadSessions(); // update sidebar
                 }
+                
+                // Auto collapse connection wrapper to save space
+                if (!connectionWrapper.classList.contains('collapsed')) {
+                    connToggleHeader.click();
+                }
+                
                 initWebSocket();
             } else {
                 connStatus.textContent = "❌ " + data.message;

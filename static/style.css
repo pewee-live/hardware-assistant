@@ -433,7 +433,7 @@ input:disabled {
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
-    max-height: 200px;
+    flex: 1; min-height: 100px;
     overflow-y: auto;
     scrollbar-width: thin;
     scrollbar-color: rgba(255,255,255,0.1) transparent;
@@ -467,5 +467,27 @@ input:disabled {
 .session-item .session-date {
     font-size: 0.75rem;
     color: var(--text-secondary);
+}
+
+
+.connection-wrapper {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+    overflow: hidden;
+    transition: max-height 0.3s ease-out, opacity 0.3s ease-out;
+    max-height: 600px;
+    opacity: 1;
+}
+
+.connection-wrapper.collapsed {
+    max-height: 0;
+    opacity: 0;
+    margin: 0;
+    gap: 0;
+}
+
+.connection-header:hover h2 {
+    color: var(--primary-color);
 }
 
