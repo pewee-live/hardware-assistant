@@ -11,6 +11,14 @@
     <div class="app-container">
         <!-- Sidebar -->
         <aside class="sidebar glass-panel">
+            <h2>Sessions</h2>
+            <button id="new-chat-btn" class="btn primary-btn" style="margin-bottom: 1rem;">+ New Chat</button>
+            <div id="session-list" class="session-list">
+                <!-- Session items will be dynamically added here -->
+            </div>
+            
+            <hr style="border: 0; border-top: 1px solid var(--glass-border); margin: 1rem 0;">
+            
             <h2>Connection</h2>
             <div class="tabs">
                 <button class="tab-btn active" data-type="ssh">SSH</button>
@@ -40,7 +48,7 @@
         <!-- Main Chat Area -->
         <main class="chat-area">
             <header class="chat-header glass-panel">
-                <h1>Hardware Agent Console</h1>
+                <h1 id="chat-title">Hardware Agent Console</h1>
                 <span id="agent-status" class="badge idle">Ready</span>
             </header>
             

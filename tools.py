@@ -3,6 +3,8 @@ import paramiko
 import serial
 from typing import Optional
 from getpass import getpass
+import os
+from datetime import datetime
 from langchain_core.tools import tool
 
 # Dictionary/List of password prompt keywords (English and Chinese)
@@ -54,6 +56,25 @@ class ConnectionManager:
         self.conn_type = None
         return "Disconnected successfully."
 
+    def _log_command(self, command: str):
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open("data/command_history.log", "a", encoding="utf-8") as f:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if self.conn_type == "ssh" and self.ssh_client:
+                    try:
+                        host = self.ssh_client.get_transport().getpeername()[0]
+                    except:
+                        host = "Unknown"
+                    target = f"SSH:{host}"
+                elif self.conn_type == "serial" and self.serial_client:
+                    target = f"Serial:{self.serial_client.port}"
+                else:
+                    target = "Unknown"
+                f.write(f"[{timestamp}] [{target}] {command}\n")
+        except Exception as e:
+            print(f"Failed to log command: {e}")
+
     def execute(self, command: str) -> str:
         # --- Safety Firewall ---
         # Prevent the LLM from blindly running full-screen interactive CLI apps
@@ -67,6 +88,8 @@ class ConnectionManager:
             
         if "sensors-detect" in command and "--auto" not in command:
             return "Error: Command rejected by safety firewall. 'sensors-detect' is interactive and will wait for user input indefinitely, causing the agent to hang. Please use 'sensors-detect --auto' instead."
+
+        self._log_command(command)
 
         if self.conn_type == "ssh" and self.ssh_client:
             # get_pty=True allows commands like sudo to prompt for a password interactively

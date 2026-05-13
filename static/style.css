@@ -428,3 +428,44 @@ input:disabled {
 #modal-password {
     background: rgba(0,0,0,0.4);
 }
+
+.session-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    max-height: 200px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255,255,255,0.1) transparent;
+}
+.session-list::-webkit-scrollbar { width: 4px; }
+.session-list::-webkit-scrollbar-thumb { background-color: rgba(255,255,255,0.1); border-radius: 10px; }
+
+.session-item {
+    padding: 0.75rem;
+    background: rgba(0,0,0,0.2);
+    border: 1px solid transparent;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    font-size: 0.9rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+}
+.session-item:hover {
+    background: rgba(255,255,255,0.05);
+}
+.session-item.active {
+    background: rgba(59, 130, 246, 0.15);
+    border-color: rgba(59, 130, 246, 0.3);
+}
+.session-item .session-name {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+.session-item .session-date {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+

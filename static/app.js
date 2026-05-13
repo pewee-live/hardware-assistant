@@ -13,15 +13,122 @@ document.addEventListener('DOMContentLoaded', () => {
     const chatForm = document.getElementById('chat-form');
     const messageFeed = document.getElementById('message-feed');
     const agentStatus = document.getElementById('agent-status');
+    const chatTitle = document.getElementById('chat-title');
 
     const passwordModal = document.getElementById('password-modal');
     const passwordForm = document.getElementById('password-form');
     const modalPassword = document.getElementById('modal-password');
     const passwordPromptText = document.getElementById('password-prompt-text');
+    
+    const sessionList = document.getElementById('session-list');
+    const newChatBtn = document.getElementById('new-chat-btn');
 
     let currentConnType = 'ssh';
     let ws = null;
     let currentTerminalBlock = null;
+    let activeSessionId = null;
+
+    // Fetch initial sessions
+    async function loadSessions() {
+        try {
+            const res = await fetch('/api/sessions');
+            const data = await res.json();
+            if (data.status === 'success') {
+                renderSessionList(data.sessions);
+                return data.sessions;
+            }
+        } catch (e) {
+            console.error("Failed to load sessions:", e);
+        }
+        return [];
+    }
+
+    function renderSessionList(sessions) {
+        sessionList.innerHTML = '';
+        sessions.forEach(session => {
+            const div = document.createElement('div');
+            div.className = `session-item ${session.session_id === activeSessionId ? 'active' : ''}`;
+            
+            const nameEl = document.createElement('div');
+            nameEl.className = 'session-name';
+            nameEl.textContent = session.name;
+            
+            const dateEl = document.createElement('div');
+            dateEl.className = 'session-date';
+            dateEl.textContent = new Date(session.updated_at).toLocaleString();
+            
+            div.appendChild(nameEl);
+            div.appendChild(dateEl);
+            
+            div.addEventListener('click', () => loadSession(session.session_id));
+            sessionList.appendChild(div);
+        });
+    }
+
+    async function createNewSession() {
+        try {
+            const res = await fetch('/api/sessions', { method: 'POST' });
+            const data = await res.json();
+            if (data.status === 'success') {
+                activeSessionId = data.session_id;
+                clearChat();
+                document.getElementById('ssh-password').value = '';
+                chatTitle.textContent = "New Hardware Agent Console";
+                loadSessions();
+            }
+        } catch (e) {
+            console.error("Failed to create new session:", e);
+        }
+    }
+
+    async function loadSession(sessionId) {
+        try {
+            const res = await fetch(`/api/sessions/${sessionId}`);
+            const data = await res.json();
+            if (data.status === 'success') {
+                activeSessionId = sessionId;
+                clearChat();
+                chatTitle.textContent = data.session.name;
+                
+                // Pre-fill connection params
+                const params = data.session.connection_params || {};
+                const connType = data.session.conn_type || 'ssh';
+                
+                tabBtns.forEach(btn => {
+                    if (btn.dataset.type === connType) {
+                        btn.click();
+                    }
+                });
+                
+                if (connType === 'ssh' && params.host) {
+                    document.getElementById('ssh-host').value = params.host;
+                    if (params.username) document.getElementById('ssh-username').value = params.username;
+                    document.getElementById('ssh-password').value = ''; // Ensure password is empty
+                } else if (connType === 'serial' && params.serial_port) {
+                    document.getElementById('serial-port').value = params.serial_port;
+                    if (params.baudrate) document.getElementById('serial-baudrate').value = params.baudrate;
+                }
+                
+                // Load history
+                if (data.session.history && data.session.history.length > 0) {
+                    const existingWelcome = document.querySelector('.welcome-message');
+                    if (existingWelcome) existingWelcome.remove();
+                    data.session.history.forEach(msg => handleAgentMessage(msg));
+                }
+                
+                // re-render to update active class
+                loadSessions();
+            }
+        } catch (e) {
+            console.error("Failed to load session details:", e);
+        }
+    }
+
+    newChatBtn.addEventListener('click', createNewSession);
+
+    function clearChat() {
+        messageFeed.innerHTML = '<div class="welcome-message">Welcome. Connect to a device to begin debugging.</div>';
+    }
 
     // Tabs toggle
     tabBtns.forEach(btn => {
@@ -34,7 +141,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 sshFields.style.display = 'flex';
                 serialFields.style.display = 'none';
                 
-                // toggle required attributes
                 sshFields.querySelectorAll('input:not(#ssh-password)').forEach(el => el.required = true);
                 serialFields.querySelectorAll('input').forEach(el => el.required = false);
             } else {
@@ -50,27 +156,25 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- Check if connection already exists ---
     async function checkExistingConnection() {
         try {
-            // Add cache: 'no-store' to prevent browser returning stale cached network requests on fast F5
+            const sessions = await loadSessions();
             const res = await fetch('/api/status', { cache: 'no-store' });
             const data = await res.json();
-            if (data.connected) {
+            
+            if (data.active_session_id) {
+                activeSessionId = data.active_session_id;
+                await loadSession(activeSessionId);
+            } else if (sessions.length > 0) {
+                // If not connected, load the most recent session locally without connecting
+                await loadSession(sessions[0].session_id);
+            } else {
+                await createNewSession();
+            }
+
+            if (data.connected && data.active_session_id === activeSessionId) {
                 connStatus.textContent = "✔ " + data.message;
                 connStatus.className = 'status-indicator connected';
                 currentConnType = data.conn_type;
                 initWebSocket();
-                
-                // Clear the welcome message if there is history
-                if (data.history && data.history.length > 0) {
-                    const existingWelcome = document.querySelector('.welcome-message');
-                    if (existingWelcome) existingWelcome.remove();
-                    data.history.forEach(msg => handleAgentMessage(msg));
-                }
-                
-                tabBtns.forEach(btn => {
-                    if (btn.dataset.type === currentConnType) {
-                        btn.click();
-                    }
-                });
             }
         } catch (e) {
             console.error("Status check failed:", e);
@@ -82,11 +186,15 @@ document.addEventListener('DOMContentLoaded', () => {
     connectForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         
+        if (!activeSessionId) {
+            await createNewSession();
+        }
+
         connectBtn.disabled = true;
         const originalText = connectBtn.textContent;
         connectBtn.textContent = 'Connecting...';
         
-        const payload = { conn_type: currentConnType };
+        const payload = { conn_type: currentConnType, session_id: activeSessionId };
         
         if (currentConnType === 'ssh') {
             payload.host = document.getElementById('ssh-host').value;
@@ -109,6 +217,13 @@ document.addEventListener('DOMContentLoaded', () => {
             if (data.status === 'success') {
                 connStatus.textContent = "✔ " + data.message;
                 connStatus.className = 'status-indicator connected';
+                // Refresh title
+                const sRes = await fetch(`/api/sessions/${activeSessionId}`);
+                const sData = await sRes.json();
+                if(sData.status === 'success') {
+                    chatTitle.textContent = sData.session.name;
+                    loadSessions(); // update sidebar
+                }
                 initWebSocket();
             } else {
                 connStatus.textContent = "❌ " + data.message;
@@ -130,21 +245,30 @@ document.addEventListener('DOMContentLoaded', () => {
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.close();
             } else {
-                connStatus.textContent = 'Disconnected';
-                connStatus.className = 'status-indicator';
-                connectForm.querySelectorAll('input').forEach(i => i.disabled = false);
-                connectBtn.style.display = 'block';
-                disconnectBtn.style.display = 'none';
+                handleDisconnectUI();
             }
         } catch (e) {
             console.error("Disconnect API failed", e);
         }
     });
 
+    function handleDisconnectUI() {
+        connStatus.textContent = 'Disconnected';
+        connStatus.className = 'status-indicator';
+        connectForm.querySelectorAll('input').forEach(i => i.disabled = false);
+        connectBtn.style.display = 'block';
+        connectBtn.disabled = false;
+        connectBtn.textContent = 'Connect';
+        disconnectBtn.style.display = 'none';
+        chatInput.disabled = true;
+        sendBtn.disabled = true;
+    }
+
     // Chat WebSocket
     function initWebSocket() {
+        if (!activeSessionId) return;
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(`${protocol}//${window.location.host}/ws/chat`);
+        ws = new WebSocket(`${protocol}//${window.location.host}/ws/chat?session_id=${activeSessionId}`);
         
         ws.onopen = () => {
             chatInput.disabled = false;
@@ -161,13 +285,7 @@ document.addEventListener('DOMContentLoaded', () => {
         };
 
         ws.onclose = () => {
-            connStatus.textContent = 'Disconnected from Server';
-            connStatus.className = 'status-indicator';
-            chatInput.disabled = true;
-            sendBtn.disabled = true;
-            connectForm.querySelectorAll('input').forEach(i => i.disabled = false);
-            connectBtn.style.display = 'block';
-            disconnectBtn.style.display = 'none';
+            handleDisconnectUI();
             ws = null;
         };
     }
@@ -264,7 +382,6 @@ document.addEventListener('DOMContentLoaded', () => {
         const div = document.createElement('div');
         div.className = `msg ${className}`;
         
-        // Simple markdown parsing for the agent
         if (className === 'msg-agent') {
             let html = text.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
             html = html.replace(/`(.*?)`/g, '<code style="background: rgba(0,0,0,0.5); padding: 2px 4px; border-radius: 4px; color: #a5d6ff;">$1</code>');
