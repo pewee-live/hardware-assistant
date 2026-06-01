@@ -79,12 +79,18 @@ class ConnectionManager:
         # --- Safety Firewall ---
         # Prevent the LLM from blindly running full-screen interactive CLI apps
         # that would trap our PTY terminal in an infinite display loop.
-        tokens = set(command.split())
+        import re
         interactive_tools = {"htop", "vi", "vim", "nano", "ncdu", "tmux", "screen", "minicom"}
-        forbidden_intersections = tokens.intersection(interactive_tools)
-        if forbidden_intersections:
-            blocked_apps = ", ".join(forbidden_intersections)
-            return f"Error: Command rejected by safety firewall. '{blocked_apps}' is an interactive/full-screen program which causes terminal deadlocks. Please use non-interactive alternatives (e.g., 'cat', 'sed -i', 'top -b -n 1')."
+        blocked_apps = []
+        for token in command.split():
+            clean_token = re.sub(r'["\'`()&|;<>~]', '', token)
+            base_name = os.path.basename(clean_token)
+            if base_name in interactive_tools:
+                blocked_apps.append(base_name)
+                
+        if blocked_apps:
+            blocked_str = ", ".join(set(blocked_apps))
+            return f"Error: Command rejected by safety firewall. '{blocked_str}' is an interactive/full-screen program which causes terminal deadlocks. Please use non-interactive alternatives (e.g., 'cat', 'sed -i', 'top -b -n 1')."
             
         if "sensors-detect" in command and "--auto" not in command:
             return "Error: Command rejected by safety firewall. 'sensors-detect' is interactive and will wait for user input indefinitely, causing the agent to hang. Please use 'sensors-detect --auto' instead."
