@@ -209,6 +209,7 @@ input:disabled {
     flex-direction: column;
     gap: 1.5rem;
     height: 100%;
+    min-width: 0;
 }
 
 .chat-header {
@@ -284,6 +285,7 @@ input:disabled {
     line-height: 1.5;
     font-size: 0.95rem;
     flex-shrink: 0;
+    overflow-wrap: break-word;
 }
 
 @keyframes slideIn {
@@ -333,6 +335,8 @@ input:disabled {
     font-family: 'Courier New', Courier, monospace;
     color: #a5d6ff;
     word-break: break-all;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
 }
 
 .terminal-log {
@@ -490,4 +494,10 @@ input:disabled {
 .connection-header:hover h2 {
     color: var(--primary-color);
 }
+
+code {
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
 
