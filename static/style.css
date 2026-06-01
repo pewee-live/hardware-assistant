@@ -55,12 +55,29 @@ body {
     display: flex;
     flex-direction: column;
     gap: 1.5rem;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255,255,255,0.1) transparent;
+}
+
+.sidebar::-webkit-scrollbar {
+    width: 4px;
+}
+
+.sidebar::-webkit-scrollbar-thumb {
+    background-color: rgba(255,255,255,0.1);
+    border-radius: 10px;
 }
 
 .sidebar h2 {
     font-size: 1.25rem;
     font-weight: 600;
     margin-bottom: 0.5rem;
+    flex-shrink: 0;
+}
+
+#new-chat-btn, .connection-header {
+    flex-shrink: 0;
 }
 
 .tabs {
@@ -194,6 +211,7 @@ input:disabled {
     background: rgba(0,0,0,0.2);
     border: 1px solid transparent;
     transition: all 0.3s ease;
+    flex-shrink: 0;
 }
 
 .status-indicator.connected {
@@ -482,6 +500,7 @@ input:disabled {
     transition: max-height 0.3s ease-out, opacity 0.3s ease-out;
     max-height: 600px;
     opacity: 1;
+    flex-shrink: 0;
 }
 
 .connection-wrapper.collapsed {
