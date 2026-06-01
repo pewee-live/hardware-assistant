@@ -251,6 +251,12 @@ input:disabled {
     text-transform: uppercase;
     letter-spacing: 0.05em;
     transition: all 0.3s ease;
+    display: inline-block;
+    max-width: 240px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-align: center;
 }
 
 .badge.idle { 

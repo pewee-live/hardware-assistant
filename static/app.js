@@ -10,6 +10,7 @@ document.addEventListener('DOMContentLoaded', () => {
     
     const chatInput = document.getElementById('chat-input');
     const sendBtn = document.getElementById('send-btn');
+    const stopBtn = document.getElementById('stop-btn');
     const chatForm = document.getElementById('chat-form');
     const messageFeed = document.getElementById('message-feed');
     const agentStatus = document.getElementById('agent-status');
@@ -314,10 +315,22 @@ document.addEventListener('DOMContentLoaded', () => {
     function handleAgentMessage(data) {
         if (data.type === 'status') {
             agentStatus.textContent = data.content;
-            if(data.content.includes("Thinking")) {
+            if (data.content.includes("Thinking") || data.content.includes("Executing") || data.content.includes("processing")) {
                 agentStatus.className = "badge thinking";
+                chatInput.disabled = true;
+                sendBtn.style.display = 'none';
+                stopBtn.style.display = 'block';
             } else {
                 agentStatus.className = "badge idle";
+                stopBtn.style.display = 'none';
+                sendBtn.style.display = 'block';
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    chatInput.disabled = false;
+                    sendBtn.disabled = false;
+                } else {
+                    chatInput.disabled = true;
+                    sendBtn.disabled = true;
+                }
             }
         } 
         else if (data.type === 'user_message') {
@@ -374,6 +387,28 @@ document.addEventListener('DOMContentLoaded', () => {
         if (msg && ws && ws.readyState === WebSocket.OPEN) {
             ws.send(msg);
             chatInput.value = '';
+            chatInput.disabled = true;
+            sendBtn.disabled = true;
+        }
+    });
+
+    // Stop execution button
+    stopBtn.addEventListener('click', async () => {
+        if (!activeSessionId) return;
+        stopBtn.disabled = true;
+        const originalText = stopBtn.textContent;
+        stopBtn.textContent = 'Stopping...';
+        try {
+            await fetch('/api/interrupt', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ session_id: activeSessionId })
+            });
+        } catch (e) {
+            console.error("Failed to stop execution:", e);
+        } finally {
+            stopBtn.disabled = false;
+            stopBtn.textContent = originalText;
         }
     });
 

@@ -113,6 +113,7 @@ agent_app = None
 active_ws: Optional[WebSocket] = None
 main_loop: Optional[asyncio.AbstractEventLoop] = None
 active_sessions = {}  # session_id -> messages list
+active_agent_tasks = {}  # session_id -> active asyncio.Task running the agent graph
 active_session_id = None  # Tracks the currently connected session for callbacks
 
 # Threading mechanism for intercepting password prompts
@@ -148,9 +149,22 @@ def web_on_password_request(prompt: str) -> str:
         return getpass(prompt)
 
 
+def web_on_state_change(state: str):
+    """Callback to update the agent's current busy action status in the UI"""
+    if active_ws and main_loop:
+        asyncio.run_coroutine_threadsafe(
+            active_ws.send_json({"type": "status", "content": state}), main_loop
+        )
+
+
 # Override default CLI behavior
 DEVICE_MANAGER.on_output = web_on_output
 DEVICE_MANAGER.on_password_request = web_on_password_request
+DEVICE_MANAGER.on_state_change = web_on_state_change
+
+
+class InterruptRequest(BaseModel):
+    session_id: str
 
 
 @app.on_event("startup")
@@ -297,6 +311,26 @@ async def submit_password(req: PasswordSubmit):
     return {"status": "ok"}
 
 
+@app.post("/api/interrupt")
+async def interrupt_execution(req: InterruptRequest):
+    session_id = req.session_id
+    interrupted = False
+    
+    # 1. Cancel the active async graph task
+    if session_id in active_agent_tasks:
+        task = active_agent_tasks[session_id]
+        task.cancel()
+        interrupted = True
+        
+    # 2. Terminate any running SSH/Serial hardware command
+    DEVICE_MANAGER.interrupt()
+    
+    # Ensure any blocking password prompts are released
+    password_event.set()
+    
+    return {"status": "success", "interrupted": interrupted}
+
+
 async def summarize_context(messages, max_turns=20):
     if len(messages) <= max_turns:
         return messages
@@ -328,6 +362,65 @@ async def summarize_context(messages, max_turns=20):
     return [summary_msg] + messages_to_keep
 
 
+async def run_agent_workflow(session_id: str, ws: WebSocket, messages: list):
+    try:
+        config = {"recursion_limit": 500}
+        async for event in agent_app.astream(
+            {"messages": messages}, config=config
+        ):
+            for node_name, node_state in event.items():
+                if node_name == "agent":
+                    msg = node_state["messages"][-1]
+                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            await ws.send_json(
+                                {
+                                    "type": "tool_call",
+                                    "name": tc["name"],
+                                    "args": tc["args"],
+                                }
+                            )
+                    else:
+                        await ws.send_json(
+                            {"type": "agent_message", "content": msg.content}
+                        )
+                elif node_name in ["tools", "invalid_tools"]:
+                    await ws.send_json(
+                        {
+                            "type": "status",
+                            "content": "Thinking...",
+                        }
+                    )
+
+                new_msgs = node_state["messages"]
+                if isinstance(new_msgs, list):
+                    messages.extend(new_msgs)
+                else:
+                    messages.append(new_msgs)
+
+        await ws.send_json({"type": "status", "content": "Ready"})
+
+        # Save session
+        session_data = SESSION_MANAGER.load_session(session_id)
+        if session_data:
+            session_data["messages"] = messages_to_dict(messages)
+            SESSION_MANAGER.save_session(session_id, session_data)
+
+    except asyncio.CancelledError:
+        # Gracefully handle task cancellation (user clicked Stop)
+        await ws.send_json({"type": "status", "content": "Ready"})
+        await ws.send_json({"type": "agent_message", "content": "⚠️ Execution interrupted by user."})
+        session_data = SESSION_MANAGER.load_session(session_id)
+        if session_data:
+            session_data["messages"] = messages_to_dict(messages)
+            SESSION_MANAGER.save_session(session_id, session_data)
+        raise
+    except Exception as e:
+        await ws.send_json(
+            {"type": "error", "content": f"Graph Execution Error: {str(e)}"}
+        )
+
+
 @app.websocket("/ws/chat")
 async def websocket_endpoint(ws: WebSocket, session_id: str = Query(...)):
     global active_ws
@@ -353,60 +446,22 @@ async def websocket_endpoint(ws: WebSocket, session_id: str = Query(...)):
             data = await ws.receive_text()
             messages.append(HumanMessage(content=data))
 
-            await ws.send_json({"type": "status", "content": "Agent Thinking..."})
+            await ws.send_json({"type": "status", "content": "Thinking..."})
             await ws.send_json({"type": "user_message", "content": data})
 
             # Context Summarization
             messages = await summarize_context(messages, max_turns=20)
             active_sessions[session_id] = messages
 
+            # Run agent as a cancelable async task
+            task = asyncio.create_task(run_agent_workflow(session_id, ws, messages))
+            active_agent_tasks[session_id] = task
             try:
-                config = {"recursion_limit": 150}
-                async for event in agent_app.astream(
-                    {"messages": messages}, config=config
-                ):
-                    for node_name, node_state in event.items():
-                        if node_name == "agent":
-                            msg = node_state["messages"][-1]
-                            if hasattr(msg, "tool_calls") and msg.tool_calls:
-                                for tc in msg.tool_calls:
-                                    await ws.send_json(
-                                        {
-                                            "type": "tool_call",
-                                            "name": tc["name"],
-                                            "args": tc["args"],
-                                        }
-                                    )
-                            else:
-                                await ws.send_json(
-                                    {"type": "agent_message", "content": msg.content}
-                                )
-                        elif node_name in ["tools", "invalid_tools"]:
-                            await ws.send_json(
-                                {
-                                    "type": "status",
-                                    "content": "Tool execution finished. Agent processing results...",
-                                }
-                            )
-
-                        new_msgs = node_state["messages"]
-                        if isinstance(new_msgs, list):
-                            messages.extend(new_msgs)
-                        else:
-                            messages.append(new_msgs)
-
-                await ws.send_json({"type": "status", "content": "Ready"})
-
-                # Save session
-                session_data = SESSION_MANAGER.load_session(session_id)
-                if session_data:
-                    session_data["messages"] = messages_to_dict(messages)
-                    SESSION_MANAGER.save_session(session_id, session_data)
-
-            except Exception as e:
-                await ws.send_json(
-                    {"type": "error", "content": f"Graph Execution Error: {str(e)}"}
-                )
+                await task
+            except asyncio.CancelledError:
+                print(f"Session {session_id} run task was cancelled.")
+            finally:
+                active_agent_tasks.pop(session_id, None)
 
     except WebSocketDisconnect:
         if active_ws == ws:
