@@ -11,11 +11,58 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langchain_core.messages import messages_from_dict, messages_to_dict
 from agent import build_hardware_agent
 from llm import get_llm
 from tools import DEVICE_MANAGER
+
+def clean_message_history(messages):
+    """
+    Clean up message history to ensure validity for LLM API:
+    1. Every AIMessage with tool_calls must have corresponding ToolMessages for all of its tool_call IDs.
+       If any tool_call is missing its ToolMessage, we discard the AIMessage and all its associated ToolMessages.
+    2. Every ToolMessage must have a preceding AIMessage with a matching tool_call ID.
+       If not, we discard the ToolMessage.
+    """
+    # First, build a map of all ToolMessages in the history
+    tool_messages_by_id = {}
+    for msg in messages:
+        if isinstance(msg, ToolMessage) and msg.tool_call_id:
+            tool_messages_by_id[msg.tool_call_id] = msg
+
+    # Identify which AIMessages and ToolMessages are valid/complete
+    valid_message_ids = set()
+    
+    for msg in messages:
+        if isinstance(msg, AIMessage):
+            if msg.tool_calls:
+                # Check if all tool calls have a corresponding ToolMessage
+                has_missing = False
+                for tc in msg.tool_calls:
+                    tc_id = tc.get("id")
+                    if not tc_id or tc_id not in tool_messages_by_id:
+                        has_missing = True
+                        break
+                
+                if not has_missing:
+                    # This AIMessage and all of its ToolMessages are valid!
+                    valid_message_ids.add(id(msg))
+                    for tc in msg.tool_calls:
+                        tc_id = tc.get("id")
+                        valid_message_ids.add(id(tool_messages_by_id[tc_id]))
+            else:
+                # AIMessage with no tool calls is always valid
+                valid_message_ids.add(id(msg))
+        elif isinstance(msg, ToolMessage):
+            # ToolMessages are only valid if they were marked as valid by their corresponding AIMessage above
+            pass
+        else:
+            # HumanMessage, SystemMessage, etc., are always valid
+            valid_message_ids.add(id(msg))
+
+    cleaned = [msg for msg in messages if id(msg) in valid_message_ids]
+    return cleaned
 
 app = FastAPI()
 
@@ -197,12 +244,19 @@ async def get_session(session_id: str):
         # Load messages into memory if not already there
         if session_id not in active_sessions:
             try:
-                active_sessions[session_id] = messages_from_dict(
-                    data.get("messages", [])
-                )
+                raw_msgs = messages_from_dict(data.get("messages", []))
+                active_sessions[session_id] = clean_message_history(raw_msgs)
             except Exception as e:
                 print("Error loading messages:", e)
                 active_sessions[session_id] = []
+        else:
+            # Clean in-memory messages list if it contains dangling tool calls from a previous run
+            cleaned = clean_message_history(active_sessions[session_id])
+            if len(cleaned) < len(active_sessions[session_id]):
+                active_sessions[session_id].clear()
+                active_sessions[session_id].extend(cleaned)
+                data["messages"] = messages_to_dict(active_sessions[session_id])
+                SESSION_MANAGER.save_session(session_id, data)
 
         # Serialize history for frontend display
         history = []
@@ -336,8 +390,27 @@ async def summarize_context(messages, max_turns=20):
         return messages
 
     keep_count = 6
-    messages_to_summarize = messages[:-keep_count]
-    messages_to_keep = messages[-keep_count:]
+    split_idx = len(messages) - keep_count
+    
+    # Adjust split_idx to ensure we don't split tool calls and tool messages
+    while split_idx > 0:
+        msg_at_split = messages[split_idx]
+        if isinstance(msg_at_split, ToolMessage):
+            split_idx -= 1
+            continue
+            
+        msg_before_split = messages[split_idx - 1]
+        if isinstance(msg_before_split, AIMessage) and msg_before_split.tool_calls:
+            split_idx -= 1
+            continue
+            
+        break
+        
+    if split_idx <= 0:
+        return messages
+
+    messages_to_summarize = messages[:split_idx]
+    messages_to_keep = messages[split_idx:]
 
     llm = get_llm()
     summary_prompt = "Please summarize the following conversation history concisely, retaining all important technical context, commands executed, and current state. This summary will be used as context for the continuation of the conversation."
@@ -431,19 +504,39 @@ async def websocket_endpoint(ws: WebSocket, session_id: str = Query(...)):
         data = SESSION_MANAGER.load_session(session_id)
         if data:
             try:
-                active_sessions[session_id] = messages_from_dict(
-                    data.get("messages", [])
-                )
+                raw_msgs = messages_from_dict(data.get("messages", []))
+                active_sessions[session_id] = clean_message_history(raw_msgs)
             except Exception:
                 active_sessions[session_id] = []
         else:
             active_sessions[session_id] = []
+    else:
+        # Clean in-memory messages list if it contains dangling tool calls from a previous run
+        cleaned = clean_message_history(active_sessions[session_id])
+        if len(cleaned) < len(active_sessions[session_id]):
+            active_sessions[session_id].clear()
+            active_sessions[session_id].extend(cleaned)
+            data = SESSION_MANAGER.load_session(session_id)
+            if data:
+                data["messages"] = messages_to_dict(active_sessions[session_id])
+                SESSION_MANAGER.save_session(session_id, data)
 
     messages = active_sessions[session_id]
 
     try:
         while True:
             data = await ws.receive_text()
+            
+            # Clean up any dangling tool calls from previous runs before appending new message
+            cleaned = clean_message_history(messages)
+            if len(cleaned) < len(messages):
+                messages.clear()
+                messages.extend(cleaned)
+                session_data = SESSION_MANAGER.load_session(session_id)
+                if session_data:
+                    session_data["messages"] = messages_to_dict(messages)
+                    SESSION_MANAGER.save_session(session_id, data=session_data)
+
             messages.append(HumanMessage(content=data))
 
             await ws.send_json({"type": "status", "content": "Thinking..."})
