@@ -50,8 +50,22 @@ def build_hardware_agent():
         if not any(isinstance(m, SystemMessage) for m in messages):
             messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(messages)
 
-        response = llm_with_tools.invoke(messages)
-        return {"messages": [response]}
+        import time
+        delays = [5, 10, 20, 40, 120]
+        attempt = 0
+        
+        while True:
+            try:
+                response = llm_with_tools.invoke(messages)
+                return {"messages": [response]}
+            except Exception as e:
+                if "429" in str(e) and attempt < len(delays):
+                    delay = delays[attempt]
+                    print(f"\n[Warning] Rate limit (429) encountered. Retrying in {delay} seconds (Retry {attempt + 1}/{len(delays)})...")
+                    time.sleep(delay)
+                    attempt += 1
+                else:
+                    raise e
 
     def invalid_tools_node(state: AgentState):
         messages = state["messages"]
