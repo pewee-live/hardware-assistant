@@ -12,7 +12,7 @@
    - **SSH**：支持用户名/密码，或基于 Key 的无密码登录。
    - **串口 (Serial)**：支持直接连接诸如 CH340, CP210x 等芯片的普通 COM 口。
 3. **自主决策能力**：借助于 LangGraph 的带有工具调用的状态图 (StateGraph)，Agent 会执行指令，获取输出；如果信息不足，会继续执行更多诊断命令（类似 ReAct 模式）。
-4. **LLM 模型管理**：默认采用兼容 OpenAI 接口标准的 DeepSeek (`deepseek-chat`)。
+4. **LLM 模型管理**：采用兼容 OpenAI 接口标准的大语言模型（如 DeepSeek、OpenAI 原生模型、Ollama 等）。默认行为为 `deepseek-chat`。
 5. **智能密码交互逻辑**：当远端设备（SSH/串口）提示输入密码（如执行 `sudo` 等特权指令）时，Agent 的执行通道能够自动挂起并在本地控制台或网页端安全地请求用户输入密码，随后静默回传给设备。
 6. **闭环指令验证**：约束模型在对系统进行状态更改（如安装软件、修改系统配置）后，强制去执行相关的二次验证操作（如检查进程状态或获取版本号），自动防范执行失败导致的伪成功反馈。
 7. **高级 Web UI**：内置基于 FastAPI 和 WebSockets 的图形化页面，提供暗黑主题玻璃拟态界面、终端打字机效果输出以及直观的思考过程展示。
@@ -70,7 +70,7 @@ pip install -r requirements.txt
 
 ### 2. 配置大模型 API
 
-复制环境变量模板并填入你的 DeepSeek API Key：
+复制环境变量模板并填入你的 API Key：
 
 ```bash
 cp .env.example .env
@@ -78,7 +78,10 @@ cp .env.example .env
 
 编辑 `.env` 文件，修改如下字段：
 ```env
-DEEPSEEK_API_KEY=your_actual_api_key_here
+OPENAI_API_KEY=your_actual_api_key_here
+# 如果使用的是特定平台（如DeepSeek、Ollama），你可以取消注释并修改 BASE_URL 和 MODEL：
+# OPENAI_BASE_URL=https://api.deepseek.com/v1
+# OPENAI_MODEL=deepseek-chat
 ```
 
 ### 3. 开始使用
@@ -111,7 +114,7 @@ python main.py
 ```bash
 docker run -d --name ssh-helper \
   -p 8000:8000 \
-  -e DEEPSEEK_API_KEY=your_super_secret_api_key_here \
+  -e OPENAI_API_KEY=your_super_secret_api_key_here \
   peweelive/sshhelper:latest
 ```
 运行后访问：`http://localhost:8000/`
@@ -120,7 +123,7 @@ docker run -d --name ssh-helper \
 ```bash
 docker run -d --name ssh-helper \
   -p 8000:8000 \
-  -e DEEPSEEK_API_KEY=your_key \
+  -e OPENAI_API_KEY=your_key \
   --device=/dev/ttyUSB0 \
   peweelive/sshhelper:latest
 ```

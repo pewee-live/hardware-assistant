@@ -76,7 +76,7 @@ def main():
         app = build_hardware_agent()
     except Exception as e:
         print(f"Failed to initialize Agent: {e}")
-        print("Please check your .env file or environment variables for DEEPSEEK_API_KEY.")
+        print("Please check your .env file or environment variables for OPENAI_API_KEY or DEEPSEEK_API_KEY.")
         sys.exit(1)
         
     print("\\n[Agent is ready. Describe your hardware issue, or type 'exit' to quit]")
