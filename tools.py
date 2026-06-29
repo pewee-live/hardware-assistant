@@ -185,24 +185,32 @@ class ConnectionManager:
                 print(f"Error during Serial command interrupt: {e}")
 
     def _log_command(self, command: str, session_id: Optional[str] = None):
+        target = self.get_device_target(session_id)
         try:
             os.makedirs("data", exist_ok=True)
             with open("data/command_history.log", "a", encoding="utf-8") as f:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                conn = self.get_connection(session_id)
-                if conn.conn_type == "ssh" and conn.ssh_client:
-                    try:
-                        host = conn.ssh_client.get_transport().getpeername()[0]
-                    except Exception:
-                        host = "Unknown"
-                    target = f"SSH:{host}"
-                elif conn.conn_type == "serial" and conn.serial_client:
-                    target = f"Serial:{conn.serial_client.port}"
-                else:
-                    target = "Unknown"
                 f.write(f"[{timestamp}] [{target}] {command}\n")
         except Exception as e:
             print(f"Failed to log command: {e}")
+
+    def get_device_key(self, session_id: Optional[str] = None) -> Optional[str]:
+        """Return a stable identifier for the currently-connected device, used to
+        key persistent device profiles. SSH -> host IP, Serial -> port name."""
+        conn = self.get_connection(session_id)
+        if conn.conn_type == "ssh" and conn.ssh_client:
+            try:
+                return conn.ssh_client.get_transport().getpeername()[0]
+            except Exception:
+                return None
+        elif conn.conn_type == "serial" and conn.serial_client:
+            return conn.serial_client.port
+        return None
+
+    def get_device_target(self, session_id: Optional[str] = None) -> str:
+        key = self.get_device_key(session_id)
+        conn = self.get_connection(session_id)
+        return f"{conn.conn_type or 'Unknown'}:{key}" if key else "Unknown"
 
     # --- Human-in-the-loop intervention helpers -------------------------------
 
@@ -465,6 +473,104 @@ class ConnectionManager:
 DEVICE_MANAGER = ConnectionManager()
 
 
+# --- Device profile memory -------------------------------------------------
+
+import json
+import re
+
+
+class DeviceProfileManager:
+    """Persists a per-device knowledge profile so the agent can skip re-probing
+    a board it has already diagnosed. Keyed by device (host IP for SSH, port for
+    Serial). Stored as JSON files under data/devices/."""
+
+    PROFILE_FIELDS = [
+        "hostname", "os", "kernel", "architecture", "cpu", "memory",
+        "storage", "network", "notes",
+    ]
+
+    def __init__(self, data_dir="data/devices"):
+        self.data_dir = data_dir
+        os.makedirs(self.data_dir, exist_ok=True)
+
+    @staticmethod
+    def _safe_name(key: str) -> str:
+        return re.sub(r"[^A-Za-z0-9._-]", "_", key or "unknown")
+
+    def _path(self, key: str) -> str:
+        return os.path.join(self.data_dir, self._safe_name(key) + ".json")
+
+    def get_profile(self, device_key: str) -> Optional[dict]:
+        if not device_key:
+            return None
+        path = self._path(device_key)
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return None
+        return None
+
+    def get_profile_for_session(self, session_id: Optional[str]) -> Optional[dict]:
+        key = DEVICE_MANAGER.get_device_key(session_id)
+        return self.get_profile(key)
+
+    def get_profile_text(self, device_key: str) -> str:
+        """Render the profile as compact text for the system prompt."""
+        profile = self.get_profile(device_key)
+        if not profile:
+            return ""
+        lines = [f"DEVICE MEMORY ({device_key}):"]
+        for field in self.PROFILE_FIELDS:
+            val = profile.get(field)
+            if val:
+                lines.append(f"- {field}: {val}")
+        return "\n".join(lines)
+
+    def update(self, device_key: str, **fields) -> Optional[dict]:
+        """Merge non-empty fields into the stored profile, then persist it."""
+        if not device_key:
+            return None
+        profile = self.get_profile(device_key) or {"device_key": device_key}
+        changed = False
+        for field in self.PROFILE_FIELDS:
+            val = fields.get(field)
+            if val:
+                profile[field] = val
+                changed = True
+        if changed:
+            profile["device_key"] = device_key
+            profile["updated_at"] = datetime.now().isoformat()
+            path = self._path(device_key)
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(profile, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"Failed to save device profile: {e}")
+        return profile
+
+    def update_for_session(self, session_id: Optional[str], **fields) -> Optional[dict]:
+        key = DEVICE_MANAGER.get_device_key(session_id)
+        return self.update(key, **fields)
+
+    def list_profiles(self):
+        out = []
+        if os.path.isdir(self.data_dir):
+            for fn in os.listdir(self.data_dir):
+                if fn.endswith(".json"):
+                    try:
+                        with open(os.path.join(self.data_dir, fn), "r", encoding="utf-8") as f:
+                            out.append(json.load(f))
+                    except Exception:
+                        pass
+        return out
+
+
+# Global device profile manager
+DEVICE_PROFILE_MANAGER = DeviceProfileManager()
+
+
 @tool
 def execute_device_command(command: str, config: RunnableConfig) -> str:
     """
@@ -483,3 +589,51 @@ def execute_device_command(command: str, config: RunnableConfig) -> str:
         return DEVICE_MANAGER.execute(command, session_id=session_id)
     except Exception as e:
         return f"Error executing command: {str(e)}"
+
+
+@tool
+def save_device_profile(
+    config: RunnableConfig,
+    hostname: str = "",
+    os_info: str = "",
+    kernel: str = "",
+    architecture: str = "",
+    cpu: str = "",
+    memory: str = "",
+    storage: str = "",
+    network: str = "",
+    notes: str = "",
+) -> str:
+    """
+    Save or update this device's profile to long-term memory, so future debugging
+    sessions on the SAME device can skip re-running basic probes (uname, lscpu,
+    free, etc.). Call this once you have gathered the device's basic identity.
+    Only the fields you provide are updated; others are left unchanged.
+
+    Args:
+        hostname: Device hostname (e.g. 'rock-2f').
+        os_info: Operating system and version (e.g. 'Debian GNU/Linux 12 (bookworm)').
+        kernel: Kernel version (e.g. '6.1.43-26-rk2312').
+        architecture: CPU architecture (e.g. 'aarch64', 'x86_64').
+        cpu: CPU model and core count (e.g. 'ARM Cortex-A53 x4').
+        memory: Total memory (e.g. '1.9GiB').
+        storage: Notable storage (e.g. '29G eMMC (mmcblk1), 61% used').
+        network: Key network interfaces/IPs (e.g. 'enp1s0 192.168.0.108').
+        notes: Any other durable facts worth remembering for next time.
+    """
+    session_id = config.get("configurable", {}).get("session_id")
+    profile = DEVICE_PROFILE_MANAGER.update_for_session(
+        session_id,
+        hostname=hostname,
+        os=os_info,
+        kernel=kernel,
+        architecture=architecture,
+        cpu=cpu,
+        memory=memory,
+        storage=storage,
+        network=network,
+        notes=notes,
+    )
+    if profile:
+        return f"Device profile saved/updated. Current profile: {profile}"
+    return "Error: Could not determine the connected device to save a profile for. Ensure a connection is active."

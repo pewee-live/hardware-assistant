@@ -21,6 +21,11 @@
 10. **高级 Web UI**：内置基于 FastAPI 和 WebSockets 的图形化页面，提供暗黑主题玻璃拟态界面、终端打字机效果输出以及直观的思考过程展示。
 11. **交互死锁防火墙**：在底层流处理与 Agent 认知级别双重设防，自动拦截或处理诸如 `htop`、`vim`、`less` 等会导致 PTY 终端永久挂起的命令。
 12. **非法调用自我修正 (Self-Correction)**：新增对模型输出错误 JSON 或格式破坏的识别隔离节点 `invalid_tools`，原生捕获非法请求并流转回主代理，强制模型重新反思修正，彻底避免因上下文状态缺失导致的 API Error 400 中断异常。
+13. **连接断线自动重连**：网络抖动、休眠或 WiFi 切换导致 WebSocket 断开时，前端会以指数退避自动重连并回放错过的输出。由于 Agent 任务运行在与连接解耦的后台，断线不会中断任何正在进行的诊断。
+14. **会话导出**：任意会话可一键导出为 Markdown 调试报告（含命令、输出、结论与 token/成本统计），也可导出 JSON，便于团队分享与归档「上次是怎么修好的」。
+15. **设备记忆 / 画像**：对同一台设备的身份信息（OS、内核、架构、CPU、内存、存储、网络）做持久化记忆。Agent 首次探明后会主动保存，后续会话直接复用，省去重复跑 uname/lscpu/free 的开销与 token。
+16. **会话管理**：支持会话重命名与删除（悬停会话条目出现操作按钮），侧边栏不再随时间堆积成难以翻找的列表。
+17. **成本可见**：每个会话实时统计累计 token 用量（输入/输出）与估算费用，按可配置的模型定价计算，在界面顶部以徽章展示，长会话的花费一目了然。
 
 ---
 
@@ -91,6 +96,11 @@ OPENAI_API_KEY=your_actual_api_key_here
 # MODEL_CONTEXT_WINDOW=128000  # gpt-4o / gpt-4.1
 # MODEL_CONTEXT_WINDOW=200000  # claude / gemini
 # MODEL_CONTEXT_BUDGET=0.8     # 达到窗口的多少比例时开始压缩（默认 0.8）
+
+# 成本统计（token 始终统计，价格仅用于估算费用）：
+# PRICE_INPUT_PER_1M=0.27       # 默认按 DeepSeek-chat cache-miss 计价
+# PRICE_OUTPUT_PER_1M=1.10
+# COST_CURRENCY=USD
 ```
 
 ### 3. 开始使用

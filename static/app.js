@@ -27,7 +27,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const interventionForm = document.getElementById('intervention-form');
     const interventionAbort = document.getElementById('intervention-abort');
     const interventionWait = document.getElementById('intervention-wait');
-    
+
+    const costBadge = document.getElementById('cost-badge');
+    const exportBtn = document.getElementById('export-btn');
+
     const sessionList = document.getElementById('session-list');
     const newChatBtn = document.getElementById('new-chat-btn');
 
@@ -49,6 +52,10 @@ document.addEventListener('DOMContentLoaded', () => {
     let ws = null;
     let currentTerminalBlock = null;
     let activeSessionId = null;
+    let intentionalClose = false;     // distinguishes user disconnect from network drop
+    let reconnectAttempts = 0;
+    let reconnectTimer = null;
+    let currentSessionUsage = null;   // last-known token usage for the active session
 
     // Fetch initial sessions
     async function loadSessions() {
@@ -81,10 +88,26 @@ document.addEventListener('DOMContentLoaded', () => {
             dot.className = 'running-dot' + (session.running ? ' active' : '');
             dot.title = session.running ? 'Working in background' : '';
 
+            const actions = document.createElement('div');
+            actions.className = 'session-actions';
+            const renameBtn = document.createElement('button');
+            renameBtn.className = 'session-action-btn';
+            renameBtn.title = 'Rename';
+            renameBtn.textContent = 'Rename';
+            renameBtn.addEventListener('click', (ev) => { ev.stopPropagation(); renameSession(session.session_id, session.name); });
+            const delBtn = document.createElement('button');
+            delBtn.className = 'session-action-btn danger';
+            delBtn.title = 'Delete';
+            delBtn.textContent = 'Delete';
+            delBtn.addEventListener('click', (ev) => { ev.stopPropagation(); deleteSession(session.session_id); });
+            actions.appendChild(renameBtn);
+            actions.appendChild(delBtn);
+
             const row = document.createElement('div');
             row.className = 'session-row';
             row.appendChild(nameEl);
             row.appendChild(dot);
+            row.appendChild(actions);
 
             const dateEl = document.createElement('div');
             dateEl.className = 'session-date';
@@ -120,7 +143,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 activeSessionId = sessionId;
                 clearChat();
                 chatTitle.textContent = data.session.name;
-                
+
+                // Cost badge + export button
+                updateCostBadge(data.session.usage);
+                exportBtn.style.display = 'inline-flex';
+
+                // Device profile memory card (if a profile exists for this device)
+                renderDeviceProfile(data.session.device_profile);
+
                 // Pre-fill connection params
                 const params = data.session.connection_params || {};
                 const connType = data.session.conn_type || 'ssh';
@@ -149,9 +179,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 // Close old websocket if open
                 if (ws) {
-                    ws.onclose = null;
-                    ws.close();
-                    ws = null;
+                    closeSocketIntentionally();
                 }
 
                 // Check status and initialize websocket/UI
@@ -159,7 +187,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     const statusRes = await fetch(`/api/status?session_id=${sessionId}`, { cache: 'no-store' });
                     const statusData = await statusRes.json();
                     if (statusData.connected) {
-                        connStatus.textContent = "✔ " + statusData.message;
+                        connStatus.textContent = "鉁?" + statusData.message;
                         connStatus.className = 'status-indicator connected';
                         currentConnType = statusData.conn_type;
                         initWebSocket();
@@ -273,7 +301,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const data = await res.json();
             
             if (data.status === 'success') {
-                connStatus.textContent = "✔ " + data.message;
+                connStatus.textContent = "鉁?" + data.message;
                 connStatus.className = 'status-indicator connected';
                 // Refresh title
                 const sRes = await fetch(`/api/sessions/${activeSessionId}`);
@@ -290,13 +318,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 
                 initWebSocket();
             } else {
-                connStatus.textContent = "❌ " + data.message;
+                connStatus.textContent = "鉂?" + data.message;
                 connStatus.className = 'status-indicator';
                 connectBtn.disabled = false;
                 connectBtn.textContent = originalText;
             }
         } catch (err) {
-            connStatus.textContent = "❌ " + err.message;
+            connStatus.textContent = "鉂?" + err.message;
             connectBtn.disabled = false;
             connectBtn.textContent = originalText;
         }
@@ -307,7 +335,8 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             await fetch(`/api/disconnect?session_id=${activeSessionId}`, { method: 'POST' });
             if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.close();
+                closeSocketIntentionally();
+                handleDisconnectUI();
             } else {
                 handleDisconnectUI();
             }
@@ -331,6 +360,11 @@ document.addEventListener('DOMContentLoaded', () => {
     // Chat WebSocket
     function initWebSocket() {
         if (!activeSessionId) return;
+        // Reset reconnect bookkeeping on a fresh (re)connect.
+        intentionalClose = false;
+        reconnectAttempts = 0;
+        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         ws = new WebSocket(`${protocol}//${window.location.host}/ws/chat?session_id=${activeSessionId}`);
         
@@ -340,6 +374,7 @@ document.addEventListener('DOMContentLoaded', () => {
             connectForm.querySelectorAll('input').forEach(i => i.disabled = true);
             connectBtn.style.display = 'none';
             disconnectBtn.style.display = 'block';
+            agentStatus.title = '';
             chatInput.focus();
         };
 
@@ -349,9 +384,42 @@ document.addEventListener('DOMContentLoaded', () => {
         };
 
         ws.onclose = () => {
-            handleDisconnectUI();
             ws = null;
+            // If the user intentionally disconnected, just update the UI.
+            // Otherwise the network dropped -- try to reconnect so a background
+            // agent task stays visible (the task itself is never cancelled by a
+            // viewer disconnect).
+            if (intentionalClose) {
+                handleDisconnectUI();
+            } else {
+                scheduleReconnect();
+            }
         };
+        ws.onerror = () => { /* onclose handles reconnect */ };
+    }
+
+    function scheduleReconnect() {
+        if (reconnectTimer) return;
+        reconnectAttempts++;
+        const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+        agentStatus.textContent = reconnectAttempts <= 1 ? 'Reconnecting...' : `Reconnecting (${reconnectAttempts})...`;
+        agentStatus.className = 'badge reconnecting';
+        agentStatus.title = `Lost connection. Retrying in ${Math.round(delay/1000)}s.`;
+        reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            if (!activeSessionId) return;
+            initWebSocket();
+        }, delay);
+    }
+
+    function closeSocketIntentionally() {
+        intentionalClose = true;
+        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+        if (ws) {
+            ws.onclose = null;
+            try { ws.close(); } catch (e) {}
+            ws = null;
+        }
     }
 
     // Agent Message Handler
@@ -367,6 +435,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 agentStatus.className = "badge idle";
                 stopBtn.style.display = 'none';
                 sendBtn.style.display = 'block';
+                // A run just finished (status -> Ready). Refresh token usage.
+                if (data.content === 'Ready' && activeSessionId) refreshUsage();
                 if (ws && ws.readyState === WebSocket.OPEN) {
                     chatInput.disabled = false;
                     sendBtn.disabled = false;
@@ -390,7 +460,7 @@ document.addEventListener('DOMContentLoaded', () => {
         else if (data.type === 'tool_call') {
             const div = document.createElement('div');
             div.className = 'tool-call msg';
-            div.innerHTML = `⚙️ <b>Executing Tool:</b> ${data.name}<br><code>${JSON.stringify(data.args)}</code>`;
+            div.innerHTML = `鈿欙笍 <b>Executing Tool:</b> ${data.name}<br><code>${JSON.stringify(data.args)}</code>`;
             messageFeed.appendChild(div);
             scrollToBottom();
             currentTerminalBlock = null;
@@ -423,7 +493,7 @@ document.addEventListener('DOMContentLoaded', () => {
             div.style.backgroundColor = 'rgba(239, 68, 68, 0.1)';
             div.style.borderColor = 'rgba(239, 68, 68, 0.4)';
             div.style.color = '#fff';
-            div.textContent = `❌ ${data.content}`;
+            div.textContent = `鉂?${data.content}`;
             messageFeed.appendChild(div);
             scrollToBottom();
         }
@@ -499,6 +569,83 @@ document.addEventListener('DOMContentLoaded', () => {
     interventionAbort.addEventListener('click', () => submitIntervention('abort', ''));
     interventionWait.addEventListener('click', () => submitIntervention('wait', ''));
 
+    // --- Cost badge / device profile / export ---
+    function fmtTokens(n) {
+        if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
+        if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+        return String(n);
+    }
+
+    function updateCostBadge(usage) {
+        currentSessionUsage = usage;
+        if (!usage) { costBadge.textContent = '0 tokens'; return; }
+        const total = usage.total_tokens || 0;
+        const cost = usage.estimated_cost || 0;
+        const cur = usage.currency || 'USD';
+        costBadge.textContent = `${fmtTokens(total)} tokens`;
+        costBadge.title = `Input: ${usage.input_tokens || 0} | Output: ${usage.output_tokens || 0}\nEst. cost: $${cost} ${cur}`;
+    }
+
+    function renderDeviceProfile(profile) {
+        // Remove any existing card first.
+        const existing = document.querySelector('.device-profile-card');
+        if (existing) existing.remove();
+        if (!profile) return;
+        const fields = ['hostname', 'os', 'kernel', 'architecture', 'cpu', 'memory', 'storage', 'network', 'notes'];
+        const parts = [];
+        for (const f of fields) {
+            if (profile[f]) parts.push(`<b>${f}</b>: ${String(profile[f]).replace(/</g,'&lt;')}`);
+        }
+        if (!parts.length) return;
+        const card = document.createElement('div');
+        card.className = 'device-profile-card';
+        card.innerHTML = '<b>Device memory</b> &mdash; ' + parts.join(' &middot; ');
+        const welcome = document.querySelector('.welcome-message');
+        messageFeed.insertBefore(card, welcome ? welcome.nextSibling : messageFeed.firstChild);
+    }
+
+    exportBtn.addEventListener('click', () => {
+        if (!activeSessionId) return;
+        // Trigger a download via the export endpoint.
+        window.location.href = `/api/sessions/${activeSessionId}/export?format=markdown`;
+    });
+
+    async function renameSession(sessionId, currentName) {
+        const name = window.prompt('Rename session:', currentName);
+        if (name === null || !name.trim()) return;
+        try {
+            const res = await fetch(`/api/sessions/${sessionId}/rename`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: name.trim() })
+            });
+            const data = await res.json();
+            if (data.status === 'success' && sessionId === activeSessionId) {
+                chatTitle.textContent = data.name;
+            }
+            loadSessions();
+        } catch (e) { console.error('Rename failed:', e); }
+    }
+
+    async function deleteSession(sessionId) {
+        if (!window.confirm('Delete this session permanently? This cannot be undone.')) return;
+        try {
+            await fetch(`/api/sessions/${sessionId}`, { method: 'DELETE' });
+            if (sessionId === activeSessionId) {
+                closeSocketIntentionally();
+                handleDisconnectUI();
+                const list = await loadSessions();
+                if (list && list.length > 0) {
+                    loadSession(list[0].session_id);
+                } else {
+                    await createNewSession();
+                }
+            } else {
+                loadSessions();
+            }
+        } catch (e) { console.error('Delete failed:', e); }
+    }
+
     function appendMessage(text, className) {
         const div = document.createElement('div');
         div.className = `msg ${className}`;
@@ -519,5 +666,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function scrollToBottom() {
         messageFeed.scrollTop = messageFeed.scrollHeight;
+    }
+
+    async function refreshUsage() {
+        if (!activeSessionId) return;
+        try {
+            const res = await fetch(`/api/sessions/${activeSessionId}`, { cache: "no-store" });
+            const data = await res.json();
+            if (data.status === "success") updateCostBadge(data.session.usage);
+        } catch (e) { /* non-critical */ }
     }
 });

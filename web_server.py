@@ -18,7 +18,17 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, Tool
 from langchain_core.messages import messages_from_dict, messages_to_dict
 from agent import build_hardware_agent
 from llm import get_llm
-from tools import DEVICE_MANAGER
+
+
+# --- Cost / token tracking config (configurable via env) ---------------------
+# Per-1M-token prices in USD. Defaults follow DeepSeek-chat (cache-miss).
+# Override in .env for your provider. Tokens are always tracked regardless.
+PRICE_INPUT_PER_1M = float(os.getenv("PRICE_INPUT_PER_1M", "0.27"))
+PRICE_OUTPUT_PER_1M = float(os.getenv("PRICE_OUTPUT_PER_1M", "1.10"))
+CURRENCY = os.getenv("COST_CURRENCY", "USD")
+
+
+from tools import DEVICE_MANAGER, DEVICE_PROFILE_MANAGER
 
 
 def clean_message_history(messages):
@@ -59,6 +69,43 @@ def clean_message_history(messages):
 
     cleaned = [msg for msg in messages if id(msg) in valid_message_ids]
     return cleaned
+
+
+def compute_usage(messages):
+    """Sum reported token usage across all AIMessages. Returns cumulative
+    input/output tokens consumed by the session so far."""
+    input_tokens = 0
+    output_tokens = 0
+    for m in messages:
+        usage = getattr(m, "usage_metadata", None)
+        if isinstance(usage, dict):
+            input_tokens += int(usage.get("input_tokens") or 0)
+            output_tokens += int(usage.get("output_tokens") or 0)
+    cost = round(
+        (input_tokens / 1_000_000) * PRICE_INPUT_PER_1M
+        + (output_tokens / 1_000_000) * PRICE_OUTPUT_PER_1M,
+        4,
+    )
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "estimated_cost": cost,
+        "currency": CURRENCY,
+        "price_input_per_1m": PRICE_INPUT_PER_1M,
+        "price_output_per_1m": PRICE_OUTPUT_PER_1M,
+    }
+
+
+def _device_key_for_session(session_id):
+    """Resolve the persistent device key for a session: prefer the live
+    connection, fall back to the stored connection params."""
+    key = DEVICE_MANAGER.get_device_key(session_id)
+    if key:
+        return key
+    data = SESSION_MANAGER.load_session(session_id)
+    params = (data or {}).get("connection_params", {})
+    return params.get("host") or params.get("serial_port")
 
 
 app = FastAPI()
@@ -303,6 +350,43 @@ async def create_session():
     return {"status": "success", "session_id": session_id}
 
 
+class RenameRequest(BaseModel):
+    name: str
+
+
+@app.post("/api/sessions/{session_id}/rename")
+async def rename_session(session_id: str, req: RenameRequest):
+    data = SESSION_MANAGER.load_session(session_id)
+    if not data:
+        return {"status": "error", "message": "Session not found"}
+    name = (req.name or "").strip()
+    if not name:
+        return {"status": "error", "message": "Name cannot be empty"}
+    data["name"] = name
+    SESSION_MANAGER.save_session(session_id, data)
+    return {"status": "success", "name": name}
+
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session(session_id: str):
+    # Cancel any running task for this session before removing it.
+    task = active_agent_tasks.pop(session_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+    active_sessions.pop(session_id, None)
+    session_viewers.pop(session_id, None)
+    session_events.pop(session_id, None)
+    filepath = os.path.join(SESSION_MANAGER.data_dir, f"{session_id}.json")
+    removed = False
+    if os.path.exists(filepath):
+        try:
+            os.remove(filepath)
+            removed = True
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+    return {"status": "success", "removed": removed}
+
+
 @app.get("/api/sessions/{session_id}")
 async def get_session(session_id: str):
     data = SESSION_MANAGER.load_session(session_id)
@@ -334,14 +418,102 @@ async def get_session(session_id: str):
 
         data["history"] = history
         data["running"] = _is_running(session_id)
+        data["usage"] = compute_usage(active_sessions.get(session_id, []))
+        device_key = _device_key_for_session(session_id)
+        data["device_profile"] = DEVICE_PROFILE_MANAGER.get_profile(device_key)
         return {"status": "success", "session": data}
     return {"status": "error", "message": "Session not found"}
 
 
+def _render_session_markdown(session_id, data, messages):
+    """Render a session's full debugging transcript as a readable Markdown report."""
+    name = data.get("name", "Session")
+    params = data.get("connection_params", {})
+    device = data.get("conn_type") or "unknown"
+    target = params.get("host") or params.get("serial_port") or "-"
+    usage = compute_usage(messages)
+
+    lines = [
+        f"# Debug Session: {name}",
+        "",
+        f"- **Device:** {device} `{target}`",
+        f"- **Created:** {data.get('created_at', '-')}",
+        f"- **Updated:** {data.get('updated_at', '-')}",
+        f"- **Tokens:** {usage['total_tokens']:,} (in {usage['input_tokens']:,} / out {usage['output_tokens']:,})",
+        f"- **Est. cost:** {usage['estimated_cost']} {usage['currency']}",
+        "",
+        "---",
+        "",
+    ]
+
+    for m in messages:
+        if isinstance(m, HumanMessage):
+            lines += ["## User", "", str(m.content), ""]
+        elif isinstance(m, AIMessage):
+            tool_calls = getattr(m, "tool_calls", None) or []
+            if tool_calls:
+                lines.append("### Agent — commands")
+                lines.append("")
+                for tc in tool_calls:
+                    args = tc.get("args", {})
+                    cmd = args.get("command") if isinstance(args, dict) else args
+                    lines.append(f"- `{cmd}`")
+                lines.append("")
+            content = str(getattr(m, "content", "") or "").strip()
+            if content:
+                lines += ["### Agent", "", content, ""]
+        elif isinstance(m, ToolMessage):
+            content = str(getattr(m, "content", "") or "").rstrip()
+            # Keep tool output readable but trim very long dumps in the report.
+            if len(content) > 3000:
+                content = content[:1500] + f"\n\n... [{len(content) - 3000} chars truncated] ...\n\n" + content[-1500:]
+            lines += ["<details><summary>Command output</summary>", "", "```", content, "```", "", "</details>", ""]
+
+    return "\n".join(lines)
+
+
+@app.get("/api/sessions/{session_id}/export")
+async def export_session(session_id: str, format: str = "markdown"):
+    data = SESSION_MANAGER.load_session(session_id)
+    if not data:
+        return {"status": "error", "message": "Session not found"}
+    messages = active_sessions.get(session_id)
+    if messages is None:
+        try:
+            messages = clean_message_history(messages_from_dict(data.get("messages", [])))
+        except Exception:
+            messages = []
+
+    if format == "json":
+        content = json.dumps(
+            {**data, "usage": compute_usage(messages)},
+            ensure_ascii=False, indent=2,
+        )
+        mime = "application/json"
+        ext = "json"
+    else:
+        content = _render_session_markdown(session_id, data, messages)
+        mime = "text/markdown"
+        ext = "md"
+
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in (data.get("name", "session")))[:60]
+    filename = f"{safe_name}.{ext}"
+
+    import io
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(
+        io.BytesIO(content.encode("utf-8")),
+        media_type=mime,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.get("/api/status")
 async def get_status(session_id: Optional[str] = None):
+    """Connection + agent status for a session."""
     sid = session_id or active_session_id
     status = {
+        "device_profiles": len(DEVICE_PROFILE_MANAGER.list_profiles()),
         "connected": False,
         "active_session_id": active_session_id,
         "running": _is_running(sid),
@@ -402,6 +574,26 @@ async def disconnect_hardware(session_id: Optional[str] = None):
         return {"status": "success", "message": "Disconnected"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/devices")
+async def list_devices():
+    """List all known device profiles (memory)."""
+    return {"status": "success", "devices": DEVICE_PROFILE_MANAGER.list_profiles()}
+
+
+class DeviceProfileUpdate(BaseModel):
+    device_key: str
+    notes: Optional[str] = None
+
+
+@app.post("/api/devices")
+async def update_device_notes(req: DeviceProfileUpdate):
+    """Manually append notes to a device's profile from the UI."""
+    profile = DEVICE_PROFILE_MANAGER.update(req.device_key, notes=req.notes)
+    if profile:
+        return {"status": "success", "profile": profile}
+    return {"status": "error", "message": "Could not update device profile"}
 
 
 @app.post("/api/password")
@@ -648,7 +840,15 @@ async def run_agent_workflow(session_id: str, messages: list):
     """Run the agent graph as a session-scoped background task. It broadcasts
     events to whatever viewer is attached and buffers them for late viewers."""
     try:
-        config = {"recursion_limit": 500, "configurable": {"session_id": session_id}}
+        device_key = _device_key_for_session(session_id)
+        device_profile = DEVICE_PROFILE_MANAGER.get_profile_text(device_key)
+        config = {
+            "recursion_limit": 500,
+            "configurable": {
+                "session_id": session_id,
+                "device_profile": device_profile,
+            },
+        }
         await broadcast(session_id, {"type": "status", "content": "Thinking..."})
         async for event in agent_app.astream({"messages": messages}, config=config):
             for node_name, node_state in event.items():

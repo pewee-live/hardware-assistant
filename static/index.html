@@ -55,7 +55,11 @@
         <main class="chat-area">
             <header class="chat-header glass-panel">
                 <h1 id="chat-title">Hardware Agent Console</h1>
-                <span id="agent-status" class="badge idle">Ready</span>
+                <div class="header-actions">
+                    <span id="cost-badge" class="badge cost-badge" title="Token usage & estimated cost for this session">0 tokens</span>
+                    <button id="export-btn" class="icon-btn" title="Export session as report" style="display:none;">⤓</button>
+                    <span id="agent-status" class="badge idle">Ready</span>
+                </div>
             </header>
             
             <div class="message-feed" id="message-feed">
