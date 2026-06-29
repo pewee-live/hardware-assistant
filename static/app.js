@@ -20,6 +20,13 @@ document.addEventListener('DOMContentLoaded', () => {
     const passwordForm = document.getElementById('password-form');
     const modalPassword = document.getElementById('modal-password');
     const passwordPromptText = document.getElementById('password-prompt-text');
+
+    const interventionModal = document.getElementById('intervention-modal');
+    const interventionContext = document.getElementById('intervention-context');
+    const interventionInput = document.getElementById('intervention-input');
+    const interventionForm = document.getElementById('intervention-form');
+    const interventionAbort = document.getElementById('intervention-abort');
+    const interventionWait = document.getElementById('intervention-wait');
     
     const sessionList = document.getElementById('session-list');
     const newChatBtn = document.getElementById('new-chat-btn');
@@ -63,19 +70,28 @@ document.addEventListener('DOMContentLoaded', () => {
         sessions.forEach(session => {
             const div = document.createElement('div');
             div.className = `session-item ${session.session_id === activeSessionId ? 'active' : ''}`;
-            
+            div.addEventListener('click', () => loadSession(session.session_id));
+
             const nameEl = document.createElement('div');
             nameEl.className = 'session-name';
             nameEl.textContent = session.name;
-            
+            nameEl.title = session.name;
+
+            const dot = document.createElement('span');
+            dot.className = 'running-dot' + (session.running ? ' active' : '');
+            dot.title = session.running ? 'Working in background' : '';
+
+            const row = document.createElement('div');
+            row.className = 'session-row';
+            row.appendChild(nameEl);
+            row.appendChild(dot);
+
             const dateEl = document.createElement('div');
             dateEl.className = 'session-date';
             dateEl.textContent = new Date(session.updated_at).toLocaleString();
-            
-            div.appendChild(nameEl);
+
             div.appendChild(dateEl);
-            
-            div.addEventListener('click', () => loadSession(session.session_id));
+            div.insertBefore(row, div.firstChild);
             sessionList.appendChild(div);
         });
     }
@@ -129,6 +145,30 @@ document.addEventListener('DOMContentLoaded', () => {
                     const existingWelcome = document.querySelector('.welcome-message');
                     if (existingWelcome) existingWelcome.remove();
                     data.session.history.forEach(msg => handleAgentMessage(msg));
+                }
+
+                // Close old websocket if open
+                if (ws) {
+                    ws.onclose = null;
+                    ws.close();
+                    ws = null;
+                }
+
+                // Check status and initialize websocket/UI
+                try {
+                    const statusRes = await fetch(`/api/status?session_id=${sessionId}`, { cache: 'no-store' });
+                    const statusData = await statusRes.json();
+                    if (statusData.connected) {
+                        connStatus.textContent = "✔ " + statusData.message;
+                        connStatus.className = 'status-indicator connected';
+                        currentConnType = statusData.conn_type;
+                        initWebSocket();
+                    } else {
+                        handleDisconnectUI();
+                    }
+                } catch (statusErr) {
+                    console.error("Failed to fetch connection status for session:", statusErr);
+                    handleDisconnectUI();
                 }
                 
                 // re-render to update active class
@@ -184,18 +224,21 @@ document.addEventListener('DOMContentLoaded', () => {
             } else {
                 await createNewSession();
             }
-
-            if (data.connected && data.active_session_id === activeSessionId) {
-                connStatus.textContent = "✔ " + data.message;
-                connStatus.className = 'status-indicator connected';
-                currentConnType = data.conn_type;
-                initWebSocket();
-            }
         } catch (e) {
             console.error("Status check failed:", e);
         }
     }
     checkExistingConnection();
+
+    // Refresh the session list periodically so background-run status stays live,
+    // without disturbing the active chat view.
+    setInterval(async () => {
+        try {
+            const res = await fetch('/api/sessions', { cache: 'no-store' });
+            const data = await res.json();
+            if (data.status === 'success') renderSessionList(data.sessions);
+        } catch (e) { /* ignore transient poll failures */ }
+    }, 5000);
 
     // Connection Form
     connectForm.addEventListener('submit', async (e) => {
@@ -262,7 +305,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Disconnect Action
     disconnectBtn.addEventListener('click', async () => {
         try {
-            await fetch('/api/disconnect', { method: 'POST' });
+            await fetch(`/api/disconnect?session_id=${activeSessionId}`, { method: 'POST' });
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.close();
             } else {
@@ -368,6 +411,12 @@ document.addEventListener('DOMContentLoaded', () => {
             passwordModal.classList.add('active');
             setTimeout(() => modalPassword.focus(), 100);
         }
+        else if (data.type === 'intervention_request') {
+            interventionContext.textContent = data.context || '(no output yet)';
+            interventionInput.value = '';
+            interventionModal.classList.add('active');
+            setTimeout(() => interventionInput.focus(), 100);
+        }
         else if (data.type === 'error') {
             const div = document.createElement('div');
             div.className = 'msg msg-agent';
@@ -423,7 +472,7 @@ document.addEventListener('DOMContentLoaded', () => {
             await fetch('/api/password', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ password: pwd })
+                body: JSON.stringify({ password: pwd, session_id: activeSessionId })
             });
             passwordModal.classList.remove('active');
         } catch (err) {
@@ -432,6 +481,23 @@ document.addEventListener('DOMContentLoaded', () => {
             submitBtn.disabled = false;
         }
     });
+
+    // --- Manual intervention ---
+    function submitIntervention(action, input) {
+        fetch('/api/intervention', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ action, input: input || '', session_id: activeSessionId })
+        }).catch(err => console.error('Intervention submit error:', err));
+        interventionModal.classList.remove('active');
+    }
+
+    interventionForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        submitIntervention('send', interventionInput.value);
+    });
+    interventionAbort.addEventListener('click', () => submitIntervention('abort', ''));
+    interventionWait.addEventListener('click', () => submitIntervention('wait', ''));
 
     function appendMessage(text, className) {
         const div = document.createElement('div');

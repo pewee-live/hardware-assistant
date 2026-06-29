@@ -11,11 +11,15 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langchain_core.messages import messages_from_dict, messages_to_dict
 from agent import build_hardware_agent
 from llm import get_llm
 from tools import DEVICE_MANAGER
+
 
 def clean_message_history(messages):
     """
@@ -25,48 +29,40 @@ def clean_message_history(messages):
     2. Every ToolMessage must have a preceding AIMessage with a matching tool_call ID.
        If not, we discard the ToolMessage.
     """
-    # First, build a map of all ToolMessages in the history
     tool_messages_by_id = {}
     for msg in messages:
         if isinstance(msg, ToolMessage) and msg.tool_call_id:
             tool_messages_by_id[msg.tool_call_id] = msg
 
-    # Identify which AIMessages and ToolMessages are valid/complete
     valid_message_ids = set()
-    
+
     for msg in messages:
         if isinstance(msg, AIMessage):
             if msg.tool_calls:
-                # Check if all tool calls have a corresponding ToolMessage
                 has_missing = False
                 for tc in msg.tool_calls:
                     tc_id = tc.get("id")
                     if not tc_id or tc_id not in tool_messages_by_id:
                         has_missing = True
                         break
-                
                 if not has_missing:
-                    # This AIMessage and all of its ToolMessages are valid!
                     valid_message_ids.add(id(msg))
                     for tc in msg.tool_calls:
                         tc_id = tc.get("id")
                         valid_message_ids.add(id(tool_messages_by_id[tc_id]))
             else:
-                # AIMessage with no tool calls is always valid
                 valid_message_ids.add(id(msg))
         elif isinstance(msg, ToolMessage):
-            # ToolMessages are only valid if they were marked as valid by their corresponding AIMessage above
             pass
         else:
-            # HumanMessage, SystemMessage, etc., are always valid
             valid_message_ids.add(id(msg))
 
     cleaned = [msg for msg in messages if id(msg) in valid_message_ids]
     return cleaned
 
+
 app = FastAPI()
 
-# Mount the static directory for the frontend files
 os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
 
@@ -89,9 +85,19 @@ class ConnectRequest(BaseModel):
 
 class PasswordSubmit(BaseModel):
     password: str
+    session_id: Optional[str] = None
 
 
-# Session Management
+class InterventionSubmit(BaseModel):
+    action: str          # "send" | "abort" | "wait"
+    input: Optional[str] = ""
+    session_id: Optional[str] = None
+
+
+class InterruptRequest(BaseModel):
+    session_id: str
+
+
 class SessionManager:
     def __init__(self, data_dir="data/sessions"):
         self.data_dir = data_dir
@@ -101,27 +107,19 @@ class SessionManager:
         sessions = []
         for filename in os.listdir(self.data_dir):
             if filename.endswith(".json"):
-                with open(
-                    os.path.join(self.data_dir, filename), "r", encoding="utf-8"
-                ) as f:
+                with open(os.path.join(self.data_dir, filename), "r", encoding="utf-8") as f:
                     try:
                         data = json.load(f)
-                        sessions.append(
-                            {
-                                "session_id": data.get("session_id"),
-                                "name": data.get("name", "Unknown Session"),
-                                "conn_type": data.get("conn_type"),
-                                "host": data.get("connection_params", {}).get("host"),
-                                "username": data.get("connection_params", {}).get(
-                                    "username"
-                                ),
-                                "serial_port": data.get("connection_params", {}).get(
-                                    "serial_port"
-                                ),
-                                "updated_at": data.get("updated_at"),
-                            }
-                        )
-                    except:
+                        sessions.append({
+                            "session_id": data.get("session_id"),
+                            "name": data.get("name", "Unknown Session"),
+                            "conn_type": data.get("conn_type"),
+                            "host": data.get("connection_params", {}).get("host"),
+                            "username": data.get("connection_params", {}).get("username"),
+                            "serial_port": data.get("connection_params", {}).get("serial_port"),
+                            "updated_at": data.get("updated_at"),
+                        })
+                    except Exception:
                         pass
         return sorted(sessions, key=lambda x: x.get("updated_at", ""), reverse=True)
 
@@ -155,63 +153,128 @@ class SessionManager:
 
 SESSION_MANAGER = SessionManager()
 
-# Global state
+# --- Global runtime state --------------------------------------------------
+# Concurrency model: an agent run is a session-scoped background task that is
+# fully decoupled from any WebSocket. WebSockets are just "viewers" that attach
+# to a session. Switching sessions (detaching the viewer) never cancels the run.
 agent_app = None
-active_ws: Optional[WebSocket] = None
 main_loop: Optional[asyncio.AbstractEventLoop] = None
-active_sessions = {}  # session_id -> messages list
-active_agent_tasks = {}  # session_id -> active asyncio.Task running the agent graph
-active_session_id = None  # Tracks the currently connected session for callbacks
 
-# Threading mechanism for intercepting password prompts
-password_event = threading.Event()
-password_value = ""
+active_sessions = {}        # session_id -> messages list (LLM history)
+active_agent_tasks = {}     # session_id -> asyncio.Task (running or finished)
+session_viewers = {}        # session_id -> WebSocket currently attached (or None)
+session_events = {}         # session_id -> list[dict] live event buffer for replay
+active_session_id = None    # last-viewed session, used only as a fallback
+
+# Cross-thread human-input plumbing (tool threads block on these).
+password_events = {}        # session_id -> threading.Event
+password_values = {}        # session_id -> str
+pending_passwords = {}      # session_id -> prompt text awaiting a human
+intervention_events = {}    # session_id -> threading.Event
+intervention_values = {}    # session_id -> {"action", "input"}
+pending_interventions = {}  # session_id -> context text awaiting a human
+
+SESSION_EVENT_BUFFER_CAP = 1500
 
 
-def web_on_output(text: str):
-    """Callback to stream terminal prints to the web interface"""
-    if active_ws and main_loop:
-        asyncio.run_coroutine_threadsafe(
-            active_ws.send_json({"type": "log", "content": text}), main_loop
-        )
-    else:
+def _is_running(session_id):
+    task = active_agent_tasks.get(session_id)
+    return task is not None and not task.done()
+
+
+async def broadcast(session_id, event):
+    """Append an event to the session's replay buffer and push it to the viewer
+    if one is currently attached."""
+    buf = session_events.setdefault(session_id, [])
+    buf.append(event)
+    if len(buf) > SESSION_EVENT_BUFFER_CAP:
+        del buf[: len(buf) - SESSION_EVENT_BUFFER_CAP]
+    ws = session_viewers.get(session_id)
+    if ws is not None:
+        try:
+            await ws.send_json(event)
+        except Exception:
+            pass
+
+
+def web_on_output(text: str, session_id: Optional[str] = None):
+    """Stream terminal prints to the web interface (called from tool threads)."""
+    sid = session_id or "_default"
+    event = {"type": "log", "content": text}
+    buf = session_events.setdefault(sid, [])
+    buf.append(event)
+    if len(buf) > SESSION_EVENT_BUFFER_CAP:
+        del buf[: len(buf) - SESSION_EVENT_BUFFER_CAP]
+    ws = session_viewers.get(sid)
+    if ws is not None and main_loop:
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send_json(event), main_loop)
+        except Exception:
+            pass
+    elif sid == "_default":
         print(text, end="", flush=True)
 
 
-def web_on_password_request(prompt: str) -> str:
-    """Callback to request a password from the web user and block until submitted"""
-    global password_value
-
-    if active_ws and main_loop:
-        asyncio.run_coroutine_threadsafe(
-            active_ws.send_json({"type": "password_request", "prompt": prompt}),
-            main_loop,
-        )
-        password_event.clear()
-        password_event.wait()
-        return password_value
-    else:
+def web_on_password_request(prompt: str, session_id: Optional[str] = None) -> str:
+    """Request a password from the web user and block until submitted."""
+    sid = session_id or "_default"
+    if main_loop is None:
         from getpass import getpass
-
         return getpass(prompt)
+    pending_passwords[sid] = prompt
+    ws = session_viewers.get(sid)
+    if ws is not None:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                ws.send_json({"type": "password_request", "prompt": prompt, "session_id": sid}),
+                main_loop,
+            )
+        except Exception:
+            pass
+    ev = password_events.setdefault(sid, threading.Event())
+    ev.clear()
+    ev.wait()
+    pending_passwords.pop(sid, None)
+    return password_values.pop(sid, "")
 
 
-def web_on_state_change(state: str):
-    """Callback to update the agent's current busy action status in the UI"""
-    if active_ws and main_loop:
-        asyncio.run_coroutine_threadsafe(
-            active_ws.send_json({"type": "status", "content": state}), main_loop
-        )
+def web_on_intervention(context: str, session_id: Optional[str] = None) -> dict:
+    """Hand control to the human when a command stalls. Blocks the tool thread
+    until the human decides what to do."""
+    sid = session_id or "_default"
+    pending_interventions[sid] = context
+    ws = session_viewers.get(sid)
+    if ws is not None and main_loop:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                ws.send_json({"type": "intervention_request", "context": context, "session_id": sid}),
+                main_loop,
+            )
+        except Exception:
+            pass
+    ev = intervention_events.setdefault(sid, threading.Event())
+    ev.clear()
+    ev.wait()
+    pending_interventions.pop(sid, None)
+    return intervention_values.pop(sid, {"action": "wait"})
 
 
-# Override default CLI behavior
+def web_on_state_change(state: str, session_id: Optional[str] = None):
+    sid = session_id or "_default"
+    ws = session_viewers.get(sid)
+    if ws is not None and main_loop:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                ws.send_json({"type": "status", "content": state, "session_id": sid}), main_loop
+            )
+        except Exception:
+            pass
+
+
 DEVICE_MANAGER.on_output = web_on_output
 DEVICE_MANAGER.on_password_request = web_on_password_request
 DEVICE_MANAGER.on_state_change = web_on_state_change
-
-
-class InterruptRequest(BaseModel):
-    session_id: str
+DEVICE_MANAGER.on_intervention = web_on_intervention
 
 
 @app.on_event("startup")
@@ -227,7 +290,10 @@ def startup_event():
 
 @app.get("/api/sessions")
 async def list_sessions():
-    return {"status": "success", "sessions": SESSION_MANAGER.list_sessions()}
+    sessions = SESSION_MANAGER.list_sessions()
+    for s in sessions:
+        s["running"] = _is_running(s.get("session_id"))
+    return {"status": "success", "sessions": sessions}
 
 
 @app.post("/api/sessions")
@@ -241,7 +307,6 @@ async def create_session():
 async def get_session(session_id: str):
     data = SESSION_MANAGER.load_session(session_id)
     if data:
-        # Load messages into memory if not already there
         if session_id not in active_sessions:
             try:
                 raw_msgs = messages_from_dict(data.get("messages", []))
@@ -250,7 +315,6 @@ async def get_session(session_id: str):
                 print("Error loading messages:", e)
                 active_sessions[session_id] = []
         else:
-            # Clean in-memory messages list if it contains dangling tool calls from a previous run
             cleaned = clean_message_history(active_sessions[session_id])
             if len(cleaned) < len(active_sessions[session_id]):
                 active_sessions[session_id].clear()
@@ -258,52 +322,39 @@ async def get_session(session_id: str):
                 data["messages"] = messages_to_dict(active_sessions[session_id])
                 SESSION_MANAGER.save_session(session_id, data)
 
-        # Serialize history for frontend display
         history = []
         for m in active_sessions[session_id]:
             if isinstance(m, HumanMessage):
                 history.append({"type": "user_message", "content": m.content})
             elif hasattr(m, "tool_calls") and m.tool_calls:
                 for tc in m.tool_calls:
-                    history.append(
-                        {"type": "tool_call", "name": tc["name"], "args": tc["args"]}
-                    )
+                    history.append({"type": "tool_call", "name": tc["name"], "args": tc["args"]})
             elif getattr(m, "content", None):
                 history.append({"type": "agent_message", "content": m.content})
 
         data["history"] = history
+        data["running"] = _is_running(session_id)
         return {"status": "success", "session": data}
     return {"status": "error", "message": "Session not found"}
 
 
 @app.get("/api/status")
-async def get_status():
-    status = {"connected": False, "active_session_id": active_session_id}
-    if DEVICE_MANAGER.conn_type == "ssh" and getattr(
-        DEVICE_MANAGER, "ssh_client", None
-    ):
+async def get_status(session_id: Optional[str] = None):
+    sid = session_id or active_session_id
+    status = {
+        "connected": False,
+        "active_session_id": active_session_id,
+        "running": _is_running(sid),
+    }
+    conn = DEVICE_MANAGER.get_connection(sid)
+    if conn.conn_type == "ssh" and getattr(conn, "ssh_client", None):
         try:
-            host = DEVICE_MANAGER.ssh_client.get_transport().getpeername()[0]
-        except:
+            host = conn.ssh_client.get_transport().getpeername()[0]
+        except Exception:
             host = "Unknown"
-        status.update(
-            {
-                "connected": True,
-                "conn_type": "ssh",
-                "message": f"Connected to SSH at {host}",
-            }
-        )
-    elif DEVICE_MANAGER.conn_type == "serial" and getattr(
-        DEVICE_MANAGER, "serial_client", None
-    ):
-        status.update(
-            {
-                "connected": True,
-                "conn_type": "serial",
-                "message": f"Connected to Serial port {DEVICE_MANAGER.serial_client.port}",
-            }
-        )
-
+        status.update({"connected": True, "conn_type": "ssh", "message": f"Connected to SSH at {host}"})
+    elif conn.conn_type == "serial" and getattr(conn, "serial_client", None):
+        status.update({"connected": True, "conn_type": "serial", "message": f"Connected to Serial port {conn.serial_client.port}"})
     return status
 
 
@@ -316,24 +367,15 @@ async def connect(req: ConnectRequest):
             return {"status": "error", "message": "Session not found"}
 
         if req.conn_type == "ssh":
-            msg = DEVICE_MANAGER.connect_ssh(
-                req.host, req.username, req.password, req.port
-            )
+            msg = DEVICE_MANAGER.connect_ssh(req.host, req.username, req.password, req.port, session_id=req.session_id)
             session_data["conn_type"] = "ssh"
-            session_data["connection_params"] = {
-                "host": req.host,
-                "username": req.username,
-                "port": req.port,
-            }
+            session_data["connection_params"] = {"host": req.host, "username": req.username, "port": req.port}
             if session_data["name"] == "New Session":
                 session_data["name"] = f"SSH: {req.host}"
         elif req.conn_type == "serial":
-            msg = DEVICE_MANAGER.connect_serial(req.serial_port, req.baudrate)
+            msg = DEVICE_MANAGER.connect_serial(req.serial_port, req.baudrate, session_id=req.session_id)
             session_data["conn_type"] = "serial"
-            session_data["connection_params"] = {
-                "serial_port": req.serial_port,
-                "baudrate": req.baudrate,
-            }
+            session_data["connection_params"] = {"serial_port": req.serial_port, "baudrate": req.baudrate}
             if session_data["name"] == "New Session":
                 session_data["name"] = f"Serial: {req.serial_port}"
         else:
@@ -347,11 +389,16 @@ async def connect(req: ConnectRequest):
 
 
 @app.post("/api/disconnect")
-async def disconnect_hardware():
+async def disconnect_hardware(session_id: Optional[str] = None):
     global active_session_id
+    sid = session_id or active_session_id
+    task = active_agent_tasks.get(sid)
+    if task is not None and not task.done():
+        task.cancel()
     try:
-        DEVICE_MANAGER.disconnect()
-        active_session_id = None
+        DEVICE_MANAGER.disconnect(session_id=sid)
+        if active_session_id == sid:
+            active_session_id = None
         return {"status": "success", "message": "Disconnected"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -359,9 +406,19 @@ async def disconnect_hardware():
 
 @app.post("/api/password")
 async def submit_password(req: PasswordSubmit):
-    global password_value
-    password_value = req.password
-    password_event.set()
+    sid = req.session_id or active_session_id or "_default"
+    password_values[sid] = req.password
+    if sid in password_events:
+        password_events[sid].set()
+    return {"status": "ok"}
+
+
+@app.post("/api/intervention")
+async def submit_intervention(req: InterventionSubmit):
+    sid = req.session_id or active_session_id or "_default"
+    intervention_values[sid] = {"action": req.action, "input": req.input or ""}
+    if sid in intervention_events:
+        intervention_events[sid].set()
     return {"status": "ok"}
 
 
@@ -369,101 +426,241 @@ async def submit_password(req: PasswordSubmit):
 async def interrupt_execution(req: InterruptRequest):
     session_id = req.session_id
     interrupted = False
-    
-    # 1. Cancel the active async graph task
-    if session_id in active_agent_tasks:
-        task = active_agent_tasks[session_id]
+    task = active_agent_tasks.get(session_id)
+    if task is not None and not task.done():
         task.cancel()
         interrupted = True
-        
-    # 2. Terminate any running SSH/Serial hardware command
-    DEVICE_MANAGER.interrupt()
-    
-    # Ensure any blocking password prompts are released
-    password_event.set()
-    
+    DEVICE_MANAGER.interrupt(session_id=session_id)
+    sid = session_id or "_default"
+    # Release any blocking human-input prompts so the tool thread can exit.
+    intervention_values[sid] = {"action": "abort", "input": ""}
+    if sid in intervention_events:
+        intervention_events[sid].set()
+    password_values[sid] = ""
+    if sid in password_events:
+        password_events[sid].set()
     return {"status": "success", "interrupted": interrupted}
 
 
-async def summarize_context(messages, max_turns=20):
-    if len(messages) <= max_turns:
-        return messages
+async def summarize_context(messages):
+    return await compact_messages(messages)
 
-    keep_count = 6
-    split_idx = len(messages) - keep_count
-    
-    # Adjust split_idx to ensure we don't split tool calls and tool messages
+
+# --- Context-window budgeting ------------------------------------------------
+# The previous implementation triggered compaction after a fixed number of
+# messages (legacy fixed count). Because one diagnostic turn easily produces 8-13
+# messages (an AIMessage carrying several tool_calls plus their ToolMessages),
+# compaction kicked in at ~3K tokens, wasting ~95% of a 64K context window.
+#
+# The new approach is token-driven: we only touch history once the most recent
+# LLM call reported that the prompt was close to the model's budget. When we
+# must compact we prefer lossless truncation of ToolMessage bulk (which the
+# following AIMessage has already distilled) and only summarize a focused delta,
+# keeping the first HumanMessage (the original goal) verbatim. We never feed an
+# existing summary back into summarization, so quality does not erode over time.
+
+# Model context window, configurable via the MODEL_CONTEXT_WINDOW env var.
+# Defaults to 64K (works for DeepSeek/OpenAI). Set higher for long-context models,
+# e.g. MODEL_CONTEXT_WINDOW=200000 for DeepSeek-Reasoner / Claude-tier windows.
+CONTEXT_WINDOW_TOKENS = int(os.getenv("MODEL_CONTEXT_WINDOW", "64000"))
+# Start compacting once the last real prompt crossed this fraction of the window.
+# Also configurable via MODEL_CONTEXT_BUDGET (default 0.8 = compact at 80%).
+CONTEXT_BUDGET_FRACTION = float(os.getenv("MODEL_CONTEXT_BUDGET", "0.8"))
+# Tokens of headroom to leave below the budget after compaction.
+CONTEXT_TARGET_HEADROOM_TOKENS = 8000
+# Hard cap on how many recent messages are always kept verbatim (a safety net
+# for providers that don't return token usage).
+RECENT_WINDOW_MESSAGES = 12
+# A ToolMessage longer than this is truncated to its head/tail when compacted,
+# since the following AIMessage has usually already extracted its key facts.
+TOOL_BULK_TRUNCATE_CHARS = 600
+
+
+def _last_input_tokens(messages):
+    """Return the prompt token count from the most recent AIMessage that reports
+    usage metadata, or None if no provider usage is available."""
+    for m in reversed(messages):
+        usage = getattr(m, "usage_metadata", None)
+        if isinstance(usage, dict) and usage.get("input_tokens"):
+            return int(usage["input_tokens"])
+        meta = getattr(m, "response_metadata", None) or {}
+        token_usage = meta.get("token_usage") if isinstance(meta, dict) else None
+        if isinstance(token_usage, dict) and token_usage.get("prompt_tokens"):
+            return int(token_usage["prompt_tokens"])
+    return None
+
+
+def _approx_tokens(messages):
+    """Rough character-based estimate, used only when the provider reports no
+    usage (e.g. some OpenAI-compatible backends)."""
+    total = 0
+    for m in messages:
+        total += len(str(getattr(m, "content", "") or ""))
+        for tc in getattr(m, "tool_calls", []) or []:
+            total += len(str(tc.get("args", "")))
+    return total // 4
+
+
+def _truncate_tool_content(msg):
+    """Return a copy of a ToolMessage with oversized output trimmed to head/tail,
+    preserving the exit status header so the model still knows it succeeded."""
+    content = str(getattr(msg, "content", "") or "")
+    if len(content) <= TOOL_BULK_TRUNCATE_CHARS:
+        return msg
+    head = content[: TOOL_BULK_TRUNCATE_CHARS // 2]
+    tail = content[-TOOL_BULK_TRUNCATE_CHARS // 2 :]
+    return ToolMessage(
+        content=f"{head}\n... [truncated {len(content) - TOOL_BULK_TRUNCATE_CHARS} chars] ...\n{tail}",
+        tool_call_id=getattr(msg, "tool_call_id", ""),
+        name=getattr(msg, "name", None),
+    )
+
+
+def _find_safe_split(messages, keep_recent):
+    """Pick a split index such that messages[:split] is a self-contained prefix:
+    we never cut in the middle of an AIMessage+ToolMessage tool-call group, so the
+    kept tail always opens with a complete message boundary."""
+    split_idx = len(messages) - keep_recent
     while split_idx > 0:
         msg_at_split = messages[split_idx]
         if isinstance(msg_at_split, ToolMessage):
             split_idx -= 1
             continue
-            
-        msg_before_split = messages[split_idx - 1]
-        if isinstance(msg_before_split, AIMessage) and msg_before_split.tool_calls:
+        prev = messages[split_idx - 1]
+        if isinstance(prev, AIMessage) and getattr(prev, "tool_calls", None):
             split_idx -= 1
             continue
-            
         break
-        
-    if split_idx <= 0:
+    return max(split_idx, 0)
+
+
+async def compact_messages(messages):
+    """Token-budget-driven context compaction.
+
+    1. Only act when the last real prompt token count is near the model budget.
+    2. Keep the original goal (first HumanMessage) and a recent window verbatim.
+    3. For the middle, losslessly shrink ToolMessage bulk; only summarize the
+       remaining delta if it is still substantial. Existing summaries are dropped
+       from the delta so we never summarize a summary.
+    """
+    budget = int(CONTEXT_WINDOW_TOKENS * CONTEXT_BUDGET_FRACTION)
+    last_tokens = _last_input_tokens(messages)
+    est_tokens = last_tokens if last_tokens else _approx_tokens(messages)
+    if est_tokens < budget:
         return messages
 
-    messages_to_summarize = messages[:split_idx]
-    messages_to_keep = messages[split_idx:]
-
-    llm = get_llm()
-    summary_prompt = "Please summarize the following conversation history concisely, retaining all important technical context, commands executed, and current state. This summary will be used as context for the continuation of the conversation."
-
-    text_to_summarize = "\n".join(
-        [
-            f"{type(m).__name__}: {m.content}"
-            for m in messages_to_summarize
-            if getattr(m, "content", None)
-        ]
+    # Preserve the first HumanMessage (the original task) and a recent window.
+    first_human_idx = next(
+        (i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), None
     )
+    head = []
+    body_start = 0
+    if first_human_idx is not None:
+        head = messages[: first_human_idx + 1]
+        body_start = first_human_idx + 1
 
-    prompt = [
-        SystemMessage(content=summary_prompt),
-        HumanMessage(content=text_to_summarize),
+    tail = messages[-RECENT_WINDOW_MESSAGES:]
+    split_idx = _find_safe_split(messages, RECENT_WINDOW_MESSAGES)
+    split_idx = max(split_idx, body_start)
+
+    middle = messages[body_start:split_idx]
+    if not middle:
+        return messages
+
+    # Always trim oversized ToolMessage output in the middle section.
+    trimmed_middle = [
+        _truncate_tool_content(m) if isinstance(m, ToolMessage) else m
+        for m in middle
     ]
-    summary_response = await llm.ainvoke(prompt)
 
-    summary_msg = SystemMessage(
-        content=f"Previous Conversation Summary:\n{summary_response.content}"
+    # If the trimmed middle is small enough, keep it as-is (lossless) and stop.
+    trimmed_tokens = _approx_tokens(head + trimmed_middle + tail)
+    target = budget - CONTEXT_TARGET_HEADROOM_TOKENS
+    if trimmed_tokens <= target:
+        return head + trimmed_middle + tail
+
+    # Otherwise summarize a focused delta, excluding any prior summary messages
+    # so we never recursively summarize a summary.
+    delta_for_summary = [
+        m for m in trimmed_middle
+        if not (isinstance(m, SystemMessage) and "Conversation Summary" in (getattr(m, "content", "") or ""))
+    ]
+    if not delta_for_summary:
+        return head + tail
+
+    text = "\n".join(
+        f"[{type(m).__name__}] {_summarizable_text(m)}" for m in delta_for_summary
     )
-    return [summary_msg] + messages_to_keep
-
-
-async def run_agent_workflow(session_id: str, ws: WebSocket, messages: list):
+    llm = get_llm()
+    prompt = [
+        SystemMessage(
+            content=(
+                "Summarize the following earlier debugging steps concisely. Keep: "
+ "every command executed and its exit status, key findings, and the current "
+                "state/conclusion. Drop verbose command output already reflected in "
+                "later conclusions. This summary will be the only record of these steps."
+            )
+        ),
+        HumanMessage(content=text[:20000]),
+    ]
     try:
-        config = {"recursion_limit": 500}
-        async for event in agent_app.astream(
-            {"messages": messages}, config=config
-        ):
+        summary_response = await llm.ainvoke(prompt)
+        summary_text = summary_response.content
+    except Exception as e:
+        # If summarization fails, fall back to the trimmed-but-unsummarized middle
+        # rather than dropping context or crashing the turn.
+        print(f"Context summarization failed, keeping trimmed history: {e}")
+        return head + trimmed_middle + tail
+
+    summary_msg = SystemMessage(content=f"Earlier Conversation Summary:\n{summary_text}")
+    return head + [summary_msg] + tail
+
+
+def _summarizable_text(msg):
+    """Render a message for the summarizer: include the command for tool calls,
+    a short excerpt of tool output, and full text otherwise."""
+    if isinstance(msg, ToolMessage):
+        content = str(getattr(msg, "content", "") or "")
+        if len(content) > 240:
+            content = content[:120] + " ... " + content[-120:]
+        return content
+    tool_calls = getattr(msg, "tool_calls", None) or []
+    if tool_calls:
+        cmds = "; ".join(
+            str(tc.get("args", {}).get("command", tc.get("args", ""))) for tc in tool_calls
+        )
+        body = str(getattr(msg, "content", "") or "").strip()
+        return f"(tool calls: {cmds}){(' ' + body) if body else ''}"
+    return str(getattr(msg, "content", "") or "")
+
+
+def _persist_session(session_id, messages):
+    try:
+        session_data = SESSION_MANAGER.load_session(session_id)
+        if session_data:
+            session_data["messages"] = messages_to_dict(messages)
+            SESSION_MANAGER.save_session(session_id, session_data)
+    except Exception as e:
+        print(f"Failed to persist session {session_id}: {e}")
+
+
+async def run_agent_workflow(session_id: str, messages: list):
+    """Run the agent graph as a session-scoped background task. It broadcasts
+    events to whatever viewer is attached and buffers them for late viewers."""
+    try:
+        config = {"recursion_limit": 500, "configurable": {"session_id": session_id}}
+        await broadcast(session_id, {"type": "status", "content": "Thinking..."})
+        async for event in agent_app.astream({"messages": messages}, config=config):
             for node_name, node_state in event.items():
                 if node_name == "agent":
                     msg = node_state["messages"][-1]
                     if hasattr(msg, "tool_calls") and msg.tool_calls:
                         for tc in msg.tool_calls:
-                            await ws.send_json(
-                                {
-                                    "type": "tool_call",
-                                    "name": tc["name"],
-                                    "args": tc["args"],
-                                }
-                            )
+                            await broadcast(session_id, {"type": "tool_call", "name": tc["name"], "args": tc["args"]})
                     else:
-                        await ws.send_json(
-                            {"type": "agent_message", "content": msg.content}
-                        )
-                elif node_name in ["tools", "invalid_tools"]:
-                    await ws.send_json(
-                        {
-                            "type": "status",
-                            "content": "Thinking...",
-                        }
-                    )
+                        await broadcast(session_id, {"type": "agent_message", "content": msg.content})
+                elif node_name in ("tools", "invalid_tools"):
+                    await broadcast(session_id, {"type": "status", "content": "Thinking..."})
 
                 new_msgs = node_state["messages"]
                 if isinstance(new_msgs, list):
@@ -471,34 +668,33 @@ async def run_agent_workflow(session_id: str, ws: WebSocket, messages: list):
                 else:
                     messages.append(new_msgs)
 
-        await ws.send_json({"type": "status", "content": "Ready"})
-
-        # Save session
-        session_data = SESSION_MANAGER.load_session(session_id)
-        if session_data:
-            session_data["messages"] = messages_to_dict(messages)
-            SESSION_MANAGER.save_session(session_id, session_data)
-
+        await broadcast(session_id, {"type": "status", "content": "Ready"})
+        _persist_session(session_id, messages)
+        # History is now durably saved; clear the live replay buffer.
+        session_events.setdefault(session_id, []).clear()
     except asyncio.CancelledError:
-        # Gracefully handle task cancellation (user clicked Stop)
-        await ws.send_json({"type": "status", "content": "Ready"})
-        await ws.send_json({"type": "agent_message", "content": "⚠️ Execution interrupted by user."})
-        session_data = SESSION_MANAGER.load_session(session_id)
-        if session_data:
-            session_data["messages"] = messages_to_dict(messages)
-            SESSION_MANAGER.save_session(session_id, session_data)
+        try:
+            await broadcast(session_id, {"type": "status", "content": "Ready"})
+            await broadcast(session_id, {"type": "agent_message", "content": "Execution interrupted by user."})
+        except Exception:
+            pass
+        _persist_session(session_id, messages)
         raise
     except Exception as e:
-        await ws.send_json(
-            {"type": "error", "content": f"Graph Execution Error: {str(e)}"}
-        )
+        print(f"Graph Execution Error in session {session_id}: {e}")
+        try:
+            await broadcast(session_id, {"type": "error", "content": f"Graph Execution Error: {str(e)}"})
+        except Exception:
+            pass
+        _persist_session(session_id, messages)
 
 
 @app.websocket("/ws/chat")
 async def websocket_endpoint(ws: WebSocket, session_id: str = Query(...)):
-    global active_ws
+    global active_session_id
     await ws.accept()
-    active_ws = ws
+    session_viewers[session_id] = ws
+    active_session_id = session_id
 
     if session_id not in active_sessions:
         data = SESSION_MANAGER.load_session(session_id)
@@ -511,7 +707,6 @@ async def websocket_endpoint(ws: WebSocket, session_id: str = Query(...)):
         else:
             active_sessions[session_id] = []
     else:
-        # Clean in-memory messages list if it contains dangling tool calls from a previous run
         cleaned = clean_message_history(active_sessions[session_id])
         if len(cleaned) < len(active_sessions[session_id]):
             active_sessions[session_id].clear()
@@ -523,42 +718,76 @@ async def websocket_endpoint(ws: WebSocket, session_id: str = Query(...)):
 
     messages = active_sessions[session_id]
 
+    # Replay buffered live events so a reconnecting viewer catches up on a run
+    # that started (or finished) while no one was watching.
+    for ev in list(session_events.get(session_id, [])):
+        try:
+            await ws.send_json(ev)
+        except Exception:
+            break
+
+    # If a password/intervention request fired while nobody was watching,
+    # re-deliver it now so the human can answer.
+    pp = pending_passwords.get(session_id)
+    if pp is not None:
+        try:
+            await ws.send_json({"type": "password_request", "prompt": pp, "session_id": session_id})
+        except Exception:
+            pass
+    pi = pending_interventions.get(session_id)
+    if pi is not None:
+        try:
+            await ws.send_json({"type": "intervention_request", "context": pi, "session_id": session_id})
+        except Exception:
+            pass
+
+    try:
+        await ws.send_json({"type": "status", "content": "Thinking..." if _is_running(session_id) else "Ready"})
+    except Exception:
+        pass
+
     try:
         while True:
             data = await ws.receive_text()
-            
-            # Clean up any dangling tool calls from previous runs before appending new message
+            if not data.strip():
+                continue
+
+            # One run per session at a time; ignore messages while busy.
+            if _is_running(session_id):
+                try:
+                    await ws.send_json({"type": "agent_message", "content": "A task is already running in this session. Wait for it to finish or stop it first."})
+                except Exception:
+                    pass
+                continue
+
             cleaned = clean_message_history(messages)
             if len(cleaned) < len(messages):
                 messages.clear()
                 messages.extend(cleaned)
-                session_data = SESSION_MANAGER.load_session(session_id)
-                if session_data:
-                    session_data["messages"] = messages_to_dict(messages)
-                    SESSION_MANAGER.save_session(session_id, data=session_data)
+                data_sess = SESSION_MANAGER.load_session(session_id)
+                if data_sess:
+                    data_sess["messages"] = messages_to_dict(messages)
+                    SESSION_MANAGER.save_session(session_id, data_sess)
 
             messages.append(HumanMessage(content=data))
+            await broadcast(session_id, {"type": "user_message", "content": data})
+            await broadcast(session_id, {"type": "status", "content": "Thinking..."})
 
-            await ws.send_json({"type": "status", "content": "Thinking..."})
-            await ws.send_json({"type": "user_message", "content": data})
-
-            # Context Summarization
-            messages = await summarize_context(messages, max_turns=20)
+            messages = await summarize_context(messages)
             active_sessions[session_id] = messages
 
-            # Run agent as a cancelable async task
-            task = asyncio.create_task(run_agent_workflow(session_id, ws, messages))
+            task = asyncio.create_task(run_agent_workflow(session_id, messages))
             active_agent_tasks[session_id] = task
-            try:
-                await task
-            except asyncio.CancelledError:
-                print(f"Session {session_id} run task was cancelled.")
-            finally:
-                active_agent_tasks.pop(session_id, None)
-
+            task.add_done_callback(lambda t, sid=session_id: active_agent_tasks.pop(sid, None))
     except WebSocketDisconnect:
-        if active_ws == ws:
-            active_ws = None
+        pass
+    except Exception as e:
+        print(f"WebSocket error for session {session_id}: {e}")
+    finally:
+        # Only detach the viewer. NEVER cancel the agent task here -- that is the
+        # whole point of concurrent sessions.
+        if session_viewers.get(session_id) is ws:
+            session_viewers[session_id] = None
 
 
 if __name__ == "__main__":

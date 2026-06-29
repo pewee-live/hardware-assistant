@@ -86,6 +86,23 @@
         </div>
     </div>
 
+    <!-- Manual Intervention Modal -->
+    <div id="intervention-modal" class="modal-overlay">
+        <div class="modal glass-panel">
+            <h3 class="intervention-title">Manual Intervention Needed</h3>
+            <p>The agent's command appears to be waiting for input. Recent terminal output:</p>
+            <pre id="intervention-context" class="intervention-context"></pre>
+            <form id="intervention-form">
+                <input type="text" id="intervention-input" placeholder="Type what to send (e.g. y, yes, no). Leave blank for Enter." autocomplete="off">
+                <div class="intervention-actions">
+                    <button type="submit" class="btn primary-btn">Send Input</button>
+                    <button type="button" id="intervention-abort" class="btn danger-btn">Abort Command</button>
+                    <button type="button" id="intervention-wait" class="btn secondary-btn">Keep Waiting</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <script src="/static/app.js"></script>
 </body>
 </html>

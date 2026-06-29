@@ -1,0 +1,25 @@
+{
+  "session_id": "5aa6af0f-5aed-48bb-a6d6-363d1f2448ff",
+  "name": "SSH: 192.168.0.212",
+  "conn_type": "ssh",
+  "connection_params": {
+    "host": "192.168.0.212",
+    "username": "root",
+    "port": 8022
+  },
+  "messages": [
+    {
+      "type": "human",
+      "data": {
+        "content": "帮我检查hermes的配置和进程，看有哪些配置缺失了",
+        "additional_kwargs": {},
+        "response_metadata": {},
+        "type": "human",
+        "name": null,
+        "id": null
+      }
+    }
+  ],
+  "created_at": "2026-06-27T00:01:24.521576",
+  "updated_at": "2026-06-29T23:09:13.947159"
+}

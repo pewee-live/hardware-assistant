@@ -174,6 +174,16 @@ input:disabled {
     color: white;
 }
 
+.secondary-btn {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid var(--glass-border);
+    color: var(--text-primary);
+    box-shadow: none;
+}
+.secondary-btn:hover {
+    background: rgba(255,255,255,0.15);
+}
+
 .primary-btn {
     background: linear-gradient(135deg, var(--primary-color), var(--primary-hover));
     box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
@@ -523,6 +533,56 @@ input:disabled {
 code {
     overflow-wrap: break-word;
     word-break: break-word;
+}
+
+/* Intervention modal */
+.intervention-title {
+    color: #f59e0b;
+    font-size: 1.3rem;
+    font-weight: 600;
+}
+.intervention-context {
+    background: var(--terminal-bg);
+    color: var(--terminal-text);
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    padding: 1rem;
+    border-radius: 8px;
+    font-size: 0.82rem;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    max-height: 220px;
+    overflow: auto;
+    border: 1px solid rgba(255,255,255,0.08);
+}
+.intervention-actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+}
+.intervention-actions .btn {
+    flex: 1;
+    padding: 0.7rem 0.5rem;
+    font-size: 0.85rem;
+}
+
+/* Per-session "working in background" indicator */
+.session-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
+}
+.running-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.12);
+    flex-shrink: 0;
+}
+.running-dot.active {
+    background: var(--success-color);
+    box-shadow: 0 0 8px var(--success-color);
+    animation: pulse 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
 
 
