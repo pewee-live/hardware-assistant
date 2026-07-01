@@ -187,7 +187,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     const statusRes = await fetch(`/api/status?session_id=${sessionId}`, { cache: 'no-store' });
                     const statusData = await statusRes.json();
                     if (statusData.connected) {
-                        connStatus.textContent = "鉁?" + statusData.message;
+                        connStatus.textContent = "✅" + statusData.message;
                         connStatus.className = 'status-indicator connected';
                         currentConnType = statusData.conn_type;
                         initWebSocket();
@@ -301,7 +301,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const data = await res.json();
             
             if (data.status === 'success') {
-                connStatus.textContent = "鉁?" + data.message;
+                connStatus.textContent = "✅" + data.message;
                 connStatus.className = 'status-indicator connected';
                 // Refresh title
                 const sRes = await fetch(`/api/sessions/${activeSessionId}`);
@@ -318,13 +318,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 
                 initWebSocket();
             } else {
-                connStatus.textContent = "鉂?" + data.message;
+                connStatus.textContent = "❌" + data.message;
                 connStatus.className = 'status-indicator';
                 connectBtn.disabled = false;
                 connectBtn.textContent = originalText;
             }
         } catch (err) {
-            connStatus.textContent = "鉂?" + err.message;
+            connStatus.textContent = "❌" + err.message;
             connectBtn.disabled = false;
             connectBtn.textContent = originalText;
         }
@@ -460,7 +460,7 @@ document.addEventListener('DOMContentLoaded', () => {
         else if (data.type === 'tool_call') {
             const div = document.createElement('div');
             div.className = 'tool-call msg';
-            div.innerHTML = `鈿欙笍 <b>Executing Tool:</b> ${data.name}<br><code>${JSON.stringify(data.args)}</code>`;
+            div.innerHTML = `🔧 <b>Executing Tool:</b> ${data.name}<br><code>${JSON.stringify(data.args)}</code>`;
             messageFeed.appendChild(div);
             scrollToBottom();
             currentTerminalBlock = null;
@@ -493,7 +493,7 @@ document.addEventListener('DOMContentLoaded', () => {
             div.style.backgroundColor = 'rgba(239, 68, 68, 0.1)';
             div.style.borderColor = 'rgba(239, 68, 68, 0.4)';
             div.style.color = '#fff';
-            div.textContent = `鉂?${data.content}`;
+            div.textContent = `❌${data.content}`;
             messageFeed.appendChild(div);
             scrollToBottom();
         }
