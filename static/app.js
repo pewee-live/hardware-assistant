@@ -35,6 +35,14 @@ document.addEventListener('DOMContentLoaded', () => {
     const uploadBtn = document.getElementById('upload-btn');
     const uploadHint = document.getElementById('upload-hint');
 
+    const groupsToggleHeader = document.getElementById('groups-toggle-header');
+    const groupsWrapper = document.getElementById('groups-wrapper');
+    const groupsToggleIcon = document.getElementById('groups-toggle-icon');
+    const groupList = document.getElementById('group-list');
+    const newGroupBtn = document.getElementById('new-group-btn');
+    const groupCreateForm = document.getElementById('group-create-form');
+    const createGroupConfirm = document.getElementById('create-group-confirm');
+
     const sessionList = document.getElementById('session-list');
     const newChatBtn = document.getElementById('new-chat-btn');
 
@@ -223,20 +231,21 @@ document.addEventListener('DOMContentLoaded', () => {
             tabBtns.forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
             currentConnType = btn.dataset.type;
-            
-            if (currentConnType === 'ssh') {
-                sshFields.style.display = 'flex';
-                serialFields.style.display = 'none';
-                
-                sshFields.querySelectorAll('input:not(#ssh-password)').forEach(el => el.required = true);
-                serialFields.querySelectorAll('input').forEach(el => el.required = false);
-            } else {
-                sshFields.style.display = 'none';
-                serialFields.style.display = 'flex';
-                
-                sshFields.querySelectorAll('input').forEach(el => el.required = false);
-                serialFields.querySelectorAll('input').forEach(el => el.required = true);
-            }
+            // Show only the matching protocol's field set; hide all others.
+            const allFieldSets = ['ssh', 'serial', 'snmp', 'redfish', 'ipmi', 'modbus'];
+            allFieldSets.forEach(proto => {
+                const el = document.getElementById(proto + '-fields');
+                if (!el) return;
+                el.style.display = proto === currentConnType ? 'flex' : 'none';
+                el.querySelectorAll('input').forEach(inp => { inp.required = false; });
+            });
+            const active = document.getElementById(currentConnType + '-fields');
+            if (active) active.querySelectorAll('input').forEach(inp => { inp.required = true; });
+            // Password fields are always optional.
+            ['ssh-password', 'redfish-password', 'ipmi-password'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.required = false;
+            });
         });
     });
 
@@ -261,6 +270,91 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
     checkExistingConnection();
+
+
+    // --- Device groups (batch orchestration) ---
+    groupsToggleHeader.addEventListener('click', () => {
+        groupsWrapper.classList.toggle('collapsed');
+        if (groupsWrapper.classList.contains('collapsed')) {
+            groupsWrapper.style.maxHeight = '0';
+            groupsWrapper.style.opacity = '0';
+            groupsToggleIcon.style.transform = 'rotate(-90deg)';
+        } else {
+            groupsWrapper.style.maxHeight = '600px';
+            groupsWrapper.style.opacity = '1';
+            groupsToggleIcon.style.transform = 'rotate(0deg)';
+            loadGroups();
+        }
+    });
+
+    newGroupBtn.addEventListener('click', () => {
+        groupCreateForm.style.display = groupCreateForm.style.display === 'none' ? 'block' : 'none';
+    });
+
+    createGroupConfirm.addEventListener('click', async () => {
+        const name = document.getElementById('group-name').value.trim();
+        const devicesText = document.getElementById('group-devices').value.trim();
+        if (!name || !devicesText) return;
+        const targets = devicesText.split('\n').map(line => line.trim()).filter(Boolean).map(ip => ({
+            host: ip, conn_type: 'ssh', username: 'root', port: 22
+        }));
+        try {
+            const res = await fetch('/api/device-groups', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ name, targets })
+            });
+            const data = await res.json();
+            if (data.status === 'success') {
+                document.getElementById('group-name').value = '';
+                document.getElementById('group-devices').value = '';
+                groupCreateForm.style.display = 'none';
+                loadGroups();
+            }
+        } catch (e) { console.error('Create group failed:', e); }
+    });
+
+    async function loadGroups() {
+        try {
+            const res = await fetch('/api/device-groups', { cache: 'no-store' });
+            const data = await res.json();
+            if (data.status === 'success') renderGroupList(data.groups);
+        } catch (e) { /* non-critical */ }
+    }
+
+    function renderGroupList(groups) {
+        groupList.innerHTML = '';
+        if (!groups || !groups.length) {
+            groupList.innerHTML = '<div style="color:var(--text-secondary);font-size:0.8rem;padding:0.5rem;">No groups yet.</div>';
+            return;
+        }
+        groups.forEach(g => {
+            const div = document.createElement('div');
+            div.className = 'session-item';
+            const name = document.createElement('div');
+            name.className = 'session-name';
+            name.textContent = g.name + ' (' + g.device_count + ')';
+            const del = document.createElement('button');
+            del.className = 'session-action-btn danger';
+            del.textContent = '\u2715';
+            del.addEventListener('click', async (ev) => {
+                ev.stopPropagation();
+                if (!confirm('Delete group "' + g.name + '"?')) return;
+                await fetch('/api/device-groups/' + g.group_id, { method: 'DELETE' });
+                loadGroups();
+            });
+            const row = document.createElement('div');
+            row.className = 'session-row';
+            row.appendChild(name);
+            const actions = document.createElement('div');
+            actions.className = 'session-actions';
+            actions.style.display = 'flex';
+            actions.appendChild(del);
+            row.appendChild(actions);
+            div.appendChild(row);
+            groupList.appendChild(div);
+        });
+    }
 
     // Refresh the session list periodically so background-run status stays live,
     // without disturbing the active chat view.
@@ -291,9 +385,28 @@ document.addEventListener('DOMContentLoaded', () => {
             payload.username = document.getElementById('ssh-username').value;
             payload.password = document.getElementById('ssh-password').value || null;
             payload.port = parseInt(document.getElementById('ssh-port').value) || 22;
-        } else {
+        } else if (currentConnType === 'serial') {
             payload.serial_port = document.getElementById('serial-port').value;
             payload.baudrate = parseInt(document.getElementById('serial-baudrate').value) || 115200;
+        } else {
+            // Industrial protocols: store params in the session so the agent's
+            // snmp_query / redfish_query / ipmi_query / modbus_query tools can
+            // pick them up. We send them as connection metadata.
+            const ids = {
+                snmp: ['snmp-host', 'snmp-community', 'snmp-port'],
+                redfish: ['redfish-host', 'redfish-username', 'redfish-password', 'redfish-port'],
+                ipmi: ['ipmi-host', 'ipmi-username', 'ipmi-password', 'ipmi-port'],
+                modbus: ['modbus-host', 'modbus-port', 'modbus-unit-id'],
+            };
+            const fields = ids[currentConnType] || [];
+            const vals = {};
+            fields.forEach(id => {
+                const el = document.getElementById(id);
+                const key = id.replace(currentConnType + '-', '');
+                vals[key] = el ? el.value : '';
+            });
+            payload.industrial = vals;
+            payload.host = vals.host || '';
         }
 
         try {
@@ -580,7 +693,20 @@ document.addEventListener('DOMContentLoaded', () => {
     // Chat form submit
     chatForm.addEventListener('submit', (e) => {
         e.preventDefault();
-        const msg = chatInput.value.trim();
+        let msg = chatInput.value.trim();
+        // If there are staged uploads, automatically append their local paths so
+        // the agent can actually call upload_file with the right path.
+        if (window._stagedUploads && window._stagedUploads.length) {
+            const paths = window._stagedUploads.map(s => s.local_path).join(', ');
+            const names = window._stagedUploads.map(s => s.filename).join(', ');
+            if (!msg.toLowerCase().includes('upload')) {
+                msg = msg + `\n\n[Note: A file has been staged for upload: ${names} at local_path=${paths}. If the user asked to upload/transfer/push it, use the upload_file tool with this local_path.]`;
+            } else {
+                msg = msg + `\n\n[Staged file: ${names}, local_path=${paths}]`;
+            }
+            window._stagedUploads = null;
+            uploadHint.style.display = 'none';
+        }
         if (msg && ws && ws.readyState === WebSocket.OPEN) {
             ws.send(msg);
             chatInput.value = '';

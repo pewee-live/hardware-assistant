@@ -9,5 +9,6 @@ pyasn1
 pymodbus
 pyghmi
 fastapi
+python-multipart
 uvicorn
 websockets

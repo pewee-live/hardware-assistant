@@ -28,6 +28,10 @@
                 <div class="tabs">
                     <button class="tab-btn active" data-type="ssh">SSH</button>
                     <button class="tab-btn" data-type="serial">Serial</button>
+                    <button class="tab-btn" data-type="snmp">SNMP</button>
+                    <button class="tab-btn" data-type="redfish">Redfish</button>
+                    <button class="tab-btn" data-type="ipmi">IPMI</button>
+                    <button class="tab-btn" data-type="modbus">Modbus</button>
                 </div>
                 
                 <form id="connect-form" class="active-form">
@@ -43,12 +47,54 @@
                         <input type="text" id="serial-port" placeholder="COM Port / dev/tty">
                         <input type="number" id="serial-baudrate" placeholder="Baudrate" value="115200">
                     </div>
-                    
+                    <!-- SNMP Form -->
+                    <div id="snmp-fields" class="form-fields snmp-fields" style="display: none;">
+                        <input type="text" id="snmp-host" placeholder="Device IP (e.g. 192.168.1.1)" required>
+                        <input type="text" id="snmp-community" placeholder="Community (default: public)" value="public">
+                        <input type="number" id="snmp-port" placeholder="Port" value="161" required>
+                    </div>
+                    <!-- Redfish Form -->
+                    <div id="redfish-fields" class="form-fields redfish-fields" style="display: none;">
+                        <input type="text" id="redfish-host" placeholder="BMC IP" required>
+                        <input type="text" id="redfish-username" placeholder="BMC Username" required>
+                        <input type="password" id="redfish-password" placeholder="BMC Password" required>
+                        <input type="number" id="redfish-port" placeholder="Port" value="443" required>
+                    </div>
+                    <!-- IPMI Form -->
+                    <div id="ipmi-fields" class="form-fields ipmi-fields" style="display: none;">
+                        <input type="text" id="ipmi-host" placeholder="BMC IP" required>
+                        <input type="text" id="ipmi-username" placeholder="BMC Username" required>
+                        <input type="password" id="ipmi-password" placeholder="BMC Password" required>
+                        <input type="number" id="ipmi-port" placeholder="Port" value="623" required>
+                    </div>
+                    <!-- Modbus Form -->
+                    <div id="modbus-fields" class="form-fields modbus-fields" style="display: none;">
+                        <input type="text" id="modbus-host" placeholder="Device IP" required>
+                        <input type="number" id="modbus-port" placeholder="Port" value="502" required>
+                        <input type="number" id="modbus-unit-id" placeholder="Unit ID" value="1" required>
+                    </div>
+
                     <button type="submit" class="btn primary-btn" id="connect-btn">Connect</button>
                 </form>
                 <button id="disconnect-btn" class="disconnect-btn">Disconnect from Device</button>
             </div>
             <div id="conn-status" class="status-indicator">Disconnected</div>
+
+            <hr style="border: 0; border-top: 1px solid var(--glass-border); margin: 1rem 0;">
+
+            <div class="connection-header" id="groups-toggle-header" style="display: flex; justify-content: space-between; align-items: center; cursor: pointer; user-select: none;">
+                <h2>Device Groups</h2>
+                <span id="groups-toggle-icon" style="transition: transform 0.3s; font-size: 0.9rem;">&#9660;</span>
+            </div>
+            <div id="groups-wrapper" class="connection-wrapper collapsed" style="max-height:0;opacity:0;">
+                <button id="new-group-btn" class="btn secondary-btn" style="margin-bottom: 0.5rem;">+ New Group</button>
+                <div id="group-list" class="session-list" style="min-height:auto;"></div>
+                <div id="group-create-form" style="display:none;">
+                    <input type="text" id="group-name" placeholder="Group name (e.g. edge-nodes)">
+                    <textarea id="group-devices" placeholder="One device IP per line (SSH)" rows="4" style="width:100%;background:rgba(0,0,0,0.25);border:1px solid var(--glass-border);border-radius:8px;color:var(--text-primary);padding:0.6rem;font-family:inherit;font-size:0.85rem;margin-bottom:0.5rem;"></textarea>
+                    <button id="create-group-confirm" class="btn primary-btn">Create Group</button>
+                </div>
+            </div>
         </aside>
 
         <!-- Main Chat Area -->

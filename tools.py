@@ -848,6 +848,33 @@ def reboot_and_wait(config: RunnableConfig, wait_seconds: int = 60) -> str:
 # These query devices that have NO shell at all -- network gear, PLCs, BMCs.
 # ---------------------------------------------------------------------------
 
+
+
+def _resolve_industrial_params(config, kind, kwargs):
+    """Fill in missing host/credentials from the session's connection_params,
+    so the user doesn't have to repeat them after configuring a connection in the UI."""
+    params = (config or {}).get("configurable", {}).get("connection_params", {}) or {}
+    if not kwargs.get("host") and params.get("host"):
+        kwargs["host"] = params["host"]
+    if kind == "snmp":
+        if kwargs.get("community", "public") == "public" and params.get("community"):
+            kwargs["community"] = params["community"]
+        if kwargs.get("port", 161) == 161 and params.get("port"):
+            kwargs["port"] = int(params["port"])
+    elif kind in ("redfish", "ipmi"):
+        if not kwargs.get("username") and params.get("username"):
+            kwargs["username"] = params["username"]
+        if not kwargs.get("password") and params.get("password"):
+            kwargs["password"] = params["password"]
+        if kwargs.get("port", 0) in (0, 443, 623) and params.get("port"):
+            kwargs["port"] = int(params["port"])
+    elif kind == "modbus":
+        if kwargs.get("port", 502) == 502 and params.get("port"):
+            kwargs["port"] = int(params["port"])
+        if kwargs.get("unit_id", 1) == 1 and params.get("unit_id"):
+            kwargs["unit_id"] = int(params["unit_id"])
+    return kwargs
+
 from industrial import SnmpClient, ModbusClient, RedfishClient, IpmiClient
 
 # Per-session industrial clients (lazily created, reused across calls).
@@ -863,7 +890,7 @@ def _get_industrial(session_id, kind, factory):
 
 
 @tool
-def snmp_query(host: str, oid_or_name: str, operation: str = "get",
+def snmp_query(host: str = "", oid_or_name: str = "", operation: str = "get",
                community: str = "public", port: int = 161, version: int = 2,
                config: RunnableConfig = None) -> str:
     """
@@ -880,8 +907,11 @@ def snmp_query(host: str, oid_or_name: str, operation: str = "get",
         version: 1 or 2 (default 2 = SNMPv2c).
     """
     session_id = (config or {}).get("configurable", {}).get("session_id")
+    p = _resolve_industrial_params(config, "snmp", {"host": host, "community": community, "port": port, "version": version})
+    if not p["host"]:
+        return "Error: No host specified. Configure an SNMP connection first, or pass the host argument."
     try:
-        client = _get_industrial(session_id, "snmp", lambda: SnmpClient(host, community, port, version))
+        client = _get_industrial(session_id, "snmp", lambda: SnmpClient(p["host"], p["community"], p["port"], p["version"]))
         if operation == "walk":
             return client.walk(oid_or_name)
         return client.get(oid_or_name)
@@ -890,7 +920,7 @@ def snmp_query(host: str, oid_or_name: str, operation: str = "get",
 
 
 @tool
-def modbus_query(host: str, operation: str, address: int, value=None,
+def modbus_query(host: str = "", operation: str = "", address: int = 0, value=None,
                  count: int = 1, port: int = 502, unit_id: int = 1,
                  config: RunnableConfig = None) -> str:
     """
@@ -926,7 +956,7 @@ def modbus_query(host: str, operation: str, address: int, value=None,
 
 
 @tool
-def redfish_query(host: str, username: str, password: str, path: str = "",
+def redfish_query(host: str = "", username: str = "", password: str = "", path: str = "",
                   port: int = 443, use_https: bool = True,
                   config: RunnableConfig = None) -> str:
     """
@@ -957,7 +987,7 @@ def redfish_query(host: str, username: str, password: str, path: str = "",
 
 
 @tool
-def ipmi_query(host: str, username: str, password: str, operation: str = "power",
+def ipmi_query(host: str = "", username: str = "", password: str = "", operation: str = "power",
                port: int = 623, config: RunnableConfig = None) -> str:
     """
     Query a server BMC via IPMI 2.0 (RMCP+ LAN). Use this for older servers whose

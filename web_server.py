@@ -113,6 +113,14 @@ def _device_key_for_session(session_id):
     return params.get("host") or params.get("serial_port")
 
 
+def _connection_params_for_session(session_id):
+    """Return the stored connection_params for a session (used to give the
+    agent's industrial-protocol tools their default host/credentials without
+    the user having to repeat them in every message)."""
+    data = SESSION_MANAGER.load_session(session_id)
+    return (data or {}).get("connection_params", {}) or {}
+
+
 app = FastAPI()
 
 os.makedirs("static", exist_ok=True)
@@ -133,6 +141,7 @@ class ConnectRequest(BaseModel):
     port: Optional[int] = 22
     serial_port: Optional[str] = None
     baudrate: Optional[int] = 115200
+    industrial: Optional[dict] = None
 
 
 class PasswordSubmit(BaseModel):
@@ -584,6 +593,30 @@ async def connect(req: ConnectRequest):
             session_data["connection_params"] = {"serial_port": req.serial_port, "baudrate": req.baudrate}
             if session_data["name"] == "New Session":
                 session_data["name"] = f"Serial: {req.serial_port}"
+        elif req.conn_type in ("snmp", "redfish", "ipmi", "modbus"):
+            # Industrial protocols don't open a persistent connection -- they store
+            # connection params in the session so the agent's protocol tools can
+            # use them on each query. Optionally persist credentials to the vault.
+            params = req.industrial or {}
+            host = params.get("host", "") or req.host or ""
+            session_data["conn_type"] = req.conn_type
+            session_data["connection_params"] = params
+            if host:
+                session_data["connection_params"]["host"] = host
+            if session_data["name"] == "New Session":
+                session_data["name"] = f"{req.conn_type.upper()}: {host}"
+            # Persist credentials for redfish/ipmi into the encrypted vault.
+            if req.conn_type in ("redfish", "ipmi") and host:
+                try:
+                    VAULT.store(
+                        device_key=f"{req.conn_type}:{host}",
+                        conn_type=req.conn_type,
+                        params=params,
+                        secret=params.get("password"),
+                    )
+                except Exception:
+                    pass
+            msg = f"Configured {req.conn_type.upper()} access to {host}. The agent can now query this device via the {req.conn_type}_query tool."
         else:
             return {"status": "error", "message": "Unknown conn_type"}
 
@@ -1030,6 +1063,7 @@ async def run_agent_workflow(session_id: str, messages: list):
             "configurable": {
                 "session_id": session_id,
                 "device_profile": device_profile,
+                "connection_params": _connection_params_for_session(session_id),
             },
         }
         await broadcast(session_id, {"type": "status", "content": "Thinking..."})
