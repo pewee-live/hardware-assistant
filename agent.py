@@ -6,7 +6,13 @@ from langgraph.graph import StateGraph, START
 from langgraph.prebuilt import ToolNode
 
 from llm import get_llm
-from tools import execute_device_command, save_device_profile
+from tools import (
+    execute_device_command, save_device_profile,
+    upload_file, download_file, reboot_and_wait,
+    snmp_query, modbus_query, redfish_query, ipmi_query,
+    batch_run, list_device_groups,
+    snapshot_config, diff_config, list_snapshots,
+)
 
 
 class AgentState(TypedDict):
@@ -18,6 +24,10 @@ SYSTEM_PROMPT = """You are an expert hardware debugging assistant.
 Your goal is to help the user diagnose and fix problems on their development board or hardware device.
 You have access to a tool called 'execute_device_command' that allows you to run shell commands on the given device.
 The connection is established by the user locally. All you need to do is send standard Linux or board-specific commands and analyze the output to solve the issue.
+You also have 'snapshot_config', 'diff_config', and 'list_snapshots' for configuration drift detection. Capture a baseline with snapshot_config BEFORE making changes (so you have a known-good reference), and call diff_config afterwards or when troubleshooting "what changed?" -- it compares snapshots and shows exactly which config areas (ip addr, iptables, routes, services, etc.) were modified. This is invaluable for tracing the root cause of regressions like "network stopped working" or "service won't start after reboot".
+You also have 'batch_run' and 'list_device_groups' for fleet-wide operations: when the user asks to do something on MANY devices at once (e.g. "upgrade kernel on all edge nodes", "check uptime on the rack"), use 'list_device_groups' to find the group, then 'batch_run' to fan the command out concurrently with rolling/fail-fast protection. Do NOT loop 'execute_device_command' per device -- that is extremely slow.
+You also have 'snmp_query' for network devices (switches/routers/PDUs/UPS via SNMP), 'modbus_query' for industrial PLCs/sensors (Modbus TCP), 'redfish_query' for modern server BMC out-of-band management, and 'ipmi_query' for older server BMCs. Use these protocol tools instead of shell commands when the target device has no shell (it only exposes status via SNMP/Modbus/Redfish/IPMI).
+You also have 'upload_file' / 'download_file' (SFTP over SSH) for file transfer, and 'reboot_and_wait' to reboot the device and automatically reconnect when it comes back -- prefer 'reboot_and_wait' over a raw 'reboot' command, since a raw reboot kills the session and leaves you unable to continue.
 If a 'DEVICE MEMORY' section is provided below, it is durable knowledge about THIS specific device from previous sessions. Trust it and DO NOT re-run the basic probes (uname, lscpu, free, df, cat /etc/os-release) it already covers unless the user asks for fresh values or the facts look stale.
 
 Steps to debug:
@@ -39,7 +49,13 @@ Remember to think step-by-step. Don't run risky commands (like rm -rf) without u
 def build_hardware_agent():
     llm = get_llm()
     # Bind the execute function to the LLM
-    tools = [execute_device_command, save_device_profile]
+    tools = [
+        execute_device_command, save_device_profile,
+        upload_file, download_file, reboot_and_wait,
+        snmp_query, modbus_query, redfish_query, ipmi_query,
+        batch_run, list_device_groups,
+        snapshot_config, diff_config, list_snapshots,
+    ]
     llm_with_tools = llm.bind_tools(tools)
 
     # We define the node function for the agent

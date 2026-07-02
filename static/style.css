@@ -373,6 +373,17 @@ input:disabled {
 .device-profile-card b {
     color: var(--primary-color);
 }
+.upload-hint {
+    margin-top: 0.5rem;
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+    padding: 0.4rem 0.6rem;
+    background: rgba(0,0,0,0.2);
+    border-radius: 6px;
+}
+.upload-hint code {
+    color: #a5d6ff;
+}
 .badge.thinking { 
     background: rgba(59, 130, 246, 0.15); 
     color: var(--primary-color); 

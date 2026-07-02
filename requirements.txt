@@ -4,6 +4,10 @@ langchain-openai
 paramiko
 pyserial
 python-dotenv
+cryptography
+pyasn1
+pymodbus
+pyghmi
 fastapi
 uvicorn
 websockets

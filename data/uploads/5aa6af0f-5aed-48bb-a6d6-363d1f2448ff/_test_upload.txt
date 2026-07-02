@@ -1,0 +1,2 @@
+﻿test firmware content line1
+line2

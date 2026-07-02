@@ -31,6 +31,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const costBadge = document.getElementById('cost-badge');
     const exportBtn = document.getElementById('export-btn');
 
+    const fileInput = document.getElementById('file-input');
+    const uploadBtn = document.getElementById('upload-btn');
+    const uploadHint = document.getElementById('upload-hint');
+
     const sessionList = document.getElementById('session-list');
     const newChatBtn = document.getElementById('new-chat-btn');
 
@@ -371,6 +375,8 @@ document.addEventListener('DOMContentLoaded', () => {
         ws.onopen = () => {
             chatInput.disabled = false;
             sendBtn.disabled = false;
+            uploadBtn.disabled = false;
+            ensureNotifPermission();
             connectForm.querySelectorAll('input').forEach(i => i.disabled = true);
             connectBtn.style.display = 'none';
             disconnectBtn.style.display = 'block';
@@ -422,6 +428,67 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    // --- File upload ---
+    // Ask for notification permission once on first connect so background-done
+    // alerts can fire even when this tab is not focused.
+    let notifPermission = 'default';
+    function ensureNotifPermission() {
+        if (notifPermission !== 'default') return;
+        try {
+            if ('Notification' in window && Notification.permission === 'default') {
+                Notification.requestPermission().then(p => { notifPermission = p; });
+            } else if ('Notification' in window) {
+                notifPermission = Notification.permission;
+            }
+        } catch (e) {}
+    }
+
+    function notifyRunDone(sid) {
+        // Only ping when the user isn't looking at this session's tab.
+        if (document.visibilityState === 'visible' && sid === activeSessionId) return;
+        try {
+            if ('Notification' in window && Notification.permission === 'granted') {
+                new Notification('Debug task finished', {
+                    body: sid === activeSessionId ? 'Your agent finished. Switch back to see the result.' : 'A background session finished.',
+                    tag: 'session-' + sid,
+                });
+            }
+        } catch (e) {}
+        // Subtle audio cue too, for when notifications are blocked.
+        try {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.connect(gain); gain.connect(ctx.destination);
+            osc.frequency.value = 880; gain.gain.value = 0.06;
+            osc.start(); osc.stop(ctx.currentTime + 0.18);
+        } catch (e) {}
+    }
+
+    uploadBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', async () => {
+        if (!activeSessionId || !fileInput.files.length) return;
+        const files = Array.from(fileInput.files);
+        uploadHint.style.display = 'block';
+        uploadHint.textContent = 'Uploading ' + files.map(f => f.name).join(', ') + '...';
+        const staged = [];
+        for (const f of files) {
+            const fd = new FormData();
+            fd.append('file', f);
+            try {
+                const res = await fetch(`/api/sessions/${activeSessionId}/upload`, { method: 'POST', body: fd });
+                const data = await res.json();
+                if (data.status === 'success') staged.push(data);
+            } catch (e) { console.error('upload failed', e); }
+        }
+        fileInput.value = '';
+        if (!staged.length) { uploadHint.textContent = 'Upload failed.'; return; }
+        const names = staged.map(s => s.filename).join(', ');
+        uploadHint.innerHTML = 'Staged: <code>' + names + '</code>. Ask the agent to push it to the device, e.g. "upload these files to /root/".';
+        // Surface staged paths so the user can paste them into a prompt if they wish.
+        window._stagedUploads = staged;
+    });
+
     // Agent Message Handler
     function handleAgentMessage(data) {
         if (data.type === 'status') {
@@ -460,7 +527,15 @@ document.addEventListener('DOMContentLoaded', () => {
         else if (data.type === 'tool_call') {
             const div = document.createElement('div');
             div.className = 'tool-call msg';
-            div.innerHTML = `🔧 <b>Executing Tool:</b> ${data.name}<br><code>${JSON.stringify(data.args)}</code>`;
+            const toolLabel = {
+                'execute_device_command': 'Running command',
+                'save_device_profile': 'Saving device memory',
+                'upload_file': 'Uploading file',
+                'download_file': 'Downloading file',
+                'reboot_and_wait': 'Rebooting device',
+            }[data.name] || 'Executing tool';
+            const toolArgs = data.name === 'execute_device_command' ? (data.args.command || JSON.stringify(data.args)) : JSON.stringify(data.args);
+            div.innerHTML = `🔧 <b>${toolLabel}</b><br><code>${toolArgs}</code>`;
             messageFeed.appendChild(div);
             scrollToBottom();
             currentTerminalBlock = null;
@@ -496,6 +571,9 @@ document.addEventListener('DOMContentLoaded', () => {
             div.textContent = `❌${data.content}`;
             messageFeed.appendChild(div);
             scrollToBottom();
+        }
+        else if (data.type === 'run_done') {
+            notifyRunDone(data.session_id);
         }
     }
 

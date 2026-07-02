@@ -9,6 +9,9 @@ from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 
 
+import audit
+
+
 # Password / credential prompt keywords (English and Chinese).
 # When the terminal's last line contains one of these, the manager immediately
 # asks the human for the secret and forwards it.
@@ -72,6 +75,14 @@ class Connection:
         self.ssh_client: Optional[paramiko.SSHClient] = None
         self.serial_client: Optional[serial.Serial] = None
         self.active_channel: Optional[paramiko.Channel] = None
+        # Persisted connection parameters, used to re-establish the link after a
+        # reboot (reconnect) and to open SFTP channels for file transfer.
+        self.ssh_host: Optional[str] = None
+        self.ssh_username: Optional[str] = None
+        self.ssh_password: Optional[str] = None
+        self.ssh_port: int = 22
+        self.serial_port_name: Optional[str] = None
+        self.serial_baudrate: int = 115200
 
     def close(self):
         if self.ssh_client:
@@ -149,14 +160,29 @@ class ConnectionManager:
     def connect_ssh(self, host: str, username: str, password: Optional[str] = None, port: int = 22, session_id: Optional[str] = None):
         conn = self.get_connection(session_id)
         conn.conn_type = "ssh"
+        conn.ssh_host, conn.ssh_username, conn.ssh_password, conn.ssh_port = host, username, password, port
         conn.ssh_client = paramiko.SSHClient()
         conn.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         conn.ssh_client.connect(hostname=host, port=port, username=username, password=password, timeout=10)
+        # Persist credentials into the encrypted vault so reconnect (after a
+        # reboot) and the audit trail can work without a live plaintext copy.
+        try:
+            from vault import VAULT
+            VAULT.store(
+                device_key=host,
+                conn_type="ssh",
+                params={"host": host, "username": username, "port": port},
+                secret=password,
+            )
+        except Exception as e:
+            print(f"[vault] failed to store credential: {e}")
+        audit.record(session_id=session_id, device=f"ssh:{host}", command=f"<connect {username}@{host}:{port}>", exit_status=0, source="ui")
         return f"Successfully connected to SSH at {host}:{port}"
 
     def connect_serial(self, port: str, baudrate: int = 115200, session_id: Optional[str] = None):
         conn = self.get_connection(session_id)
         conn.conn_type = "serial"
+        conn.serial_port_name, conn.serial_baudrate = port, baudrate
         conn.serial_client = serial.Serial(port=port, baudrate=baudrate, timeout=3)
         return f"Successfully connected to Serial port {port} at {baudrate} baud."
 
@@ -184,8 +210,98 @@ class ConnectionManager:
             except Exception as e:
                 print(f"Error during Serial command interrupt: {e}")
 
+    def reconnect(self, session_id: Optional[str] = None, timeout: float = 120.0, poll_interval: float = 5.0) -> bool:
+        """Attempt to re-establish a connection to the same device using the
+        stored parameters. Used after a reboot/restart so the agent can keep
+        working once the host comes back. Returns True once connected."""
+        conn = self.get_connection(session_id)
+        deadline = time.time() + timeout
+        last_err = None
+        # Drop the old (now dead) client objects first so we don't reuse them.
+        conn.close()
+        while time.time() < deadline:
+            try:
+                if conn.conn_type == "ssh" or conn.ssh_host:
+                    conn.conn_type = "ssh"
+                    conn.ssh_client = paramiko.SSHClient()
+                    conn.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    # Resolve the password from the encrypted vault if it isn't
+                    # held in memory (e.g. after a server restart).
+                    pwd = conn.ssh_password
+                    if pwd is None and conn.ssh_host:
+                        try:
+                            from vault import VAULT
+                            pwd = VAULT.resolve(conn.ssh_host)
+                        except Exception:
+                            pwd = None
+                    conn.ssh_client.connect(
+                        hostname=conn.ssh_host, port=conn.ssh_port,
+                        username=conn.ssh_username, password=pwd,
+                        timeout=8,
+                    )
+                    return True
+                elif conn.conn_type == "serial" and conn.serial_port_name:
+                    conn.serial_client = serial.Serial(
+                        port=conn.serial_port_name, baudrate=conn.serial_baudrate, timeout=3
+                    )
+                    return True
+                else:
+                    return False
+            except Exception as e:
+                last_err = e
+                time.sleep(poll_interval)
+        print(f"[reconnect] gave up after {timeout}s: {last_err}")
+        return False
+
+    def upload_file(self, local_path: str, remote_path: str, session_id: Optional[str] = None) -> str:
+        """Upload a local file to the connected device via SFTP (SSH only)."""
+        conn = self.get_connection(session_id)
+        if conn.conn_type != "ssh" or not conn.ssh_client:
+            return "Error: File upload is only supported over SSH connections. Serial connections cannot transfer files."
+        if not os.path.isfile(local_path):
+            return f"Error: Local file not found: {local_path}"
+        try:
+            self.on_output(f"\n--- Uploading {os.path.basename(local_path)} -> {remote_path} ---\n", session_id)
+            transport = conn.ssh_client.get_transport()
+            sftp = paramiko.SFTPClient.from_transport(transport)
+            if sftp is None:
+                return "Error: Could not open SFTP channel over the SSH transport."
+            sftp.put(local_path, remote_path)
+            # Preserve executable bit if the source was executable.
+            try:
+                st = os.stat(local_path)
+                sftp.chmod(remote_path, st.st_mode & 0o777)
+            except Exception:
+                pass
+            sftp.close()
+            self.on_output("--- Upload Finished ---\n", session_id)
+            return f"Uploaded {local_path} -> {remote_path} ({os.path.getsize(local_path)} bytes)"
+        except Exception as e:
+            return f"Error uploading file: {e}"
+
+    def download_file(self, remote_path: str, local_path: str, session_id: Optional[str] = None) -> str:
+        """Download a file from the connected device to a local path (SSH only)."""
+        conn = self.get_connection(session_id)
+        if conn.conn_type != "ssh" or not conn.ssh_client:
+            return "Error: File download is only supported over SSH connections. Serial connections cannot transfer files."
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
+            self.on_output(f"\n--- Downloading {remote_path} -> {local_path} ---\n", session_id)
+            transport = conn.ssh_client.get_transport()
+            sftp = paramiko.SFTPClient.from_transport(transport)
+            if sftp is None:
+                return "Error: Could not open SFTP channel over the SSH transport."
+            sftp.get(remote_path, local_path)
+            sftp.close()
+            self.on_output("--- Download Finished ---\n", session_id)
+            return f"Downloaded {remote_path} -> {local_path} ({os.path.getsize(local_path)} bytes)"
+        except Exception as e:
+            return f"Error downloading file: {e}"
+
     def _log_command(self, command: str, session_id: Optional[str] = None):
         target = self.get_device_target(session_id)
+        # Append-only audit record (source of truth for /api/audit).
+        audit.record(session_id=session_id, device=target, command=command, source="agent")
         try:
             os.makedirs("data", exist_ok=True)
             with open("data/command_history.log", "a", encoding="utf-8") as f:
@@ -378,6 +494,12 @@ class ConnectionManager:
 
                 exit_status = channel.recv_exit_status()
                 self.on_output("\n--- Command Finished ---\n", session_id)
+
+                # Record exit status into the audit log (companion to _log_command).
+                audit.record(
+                    session_id=session_id, device=self.get_device_target(session_id),
+                    command=command, exit_status=exit_status, source="agent",
+                )
 
                 result = f"Exit Status: {exit_status}\n"
                 if output:
@@ -637,3 +759,515 @@ def save_device_profile(
     if profile:
         return f"Device profile saved/updated. Current profile: {profile}"
     return "Error: Could not determine the connected device to save a profile for. Ensure a connection is active."
+
+
+@tool
+def upload_file(local_path: str, remote_path: str, config: RunnableConfig) -> str:
+    """
+    Upload a local file to the connected device via SFTP (SSH connections only).
+    Use this to push firmware images, config files, or scripts onto the device.
+    The executable bit of the local file is preserved on the remote side.
+
+    Args:
+        local_path: Path to the file on the server running the agent (not the device).
+        remote_path: Absolute path on the device where the file should be written.
+    """
+    session_id = config.get("configurable", {}).get("session_id")
+    return DEVICE_MANAGER.upload_file(local_path, remote_path, session_id=session_id)
+
+
+@tool
+def download_file(remote_path: str, local_path: str, config: RunnableConfig) -> str:
+    """
+    Download a file from the connected device to the server running the agent
+    via SFTP (SSH connections only). Use this to pull logs, configs, or dumps
+    back for local inspection.
+
+    Args:
+        remote_path: Absolute path on the device to fetch.
+        local_path: Path on the server running the agent where the file is saved.
+    """
+    session_id = config.get("configurable", {}).get("session_id")
+    return DEVICE_MANAGER.download_file(remote_path, local_path, session_id=session_id)
+
+
+@tool
+def reboot_and_wait(config: RunnableConfig, wait_seconds: int = 60) -> str:
+    """
+    Reboot the connected device and wait for it to come back online, re-establishing
+    the connection automatically. Use this instead of a raw 'reboot' command,
+    because a raw reboot would kill the session and leave the agent unable to
+    continue. Only SSH connections can be auto-reconnected (the stored credentials
+    are reused); serial devices are rebooted but cannot be reliably re-detected.
+
+    Args:
+        wait_seconds: Maximum seconds to wait for the device to come back online
+            before giving up. Default 60. Increase for slow-booting boards.
+    """
+    session_id = config.get("configurable", {}).get("session_id")
+    conn = DEVICE_MANAGER.get_connection(session_id)
+    if not conn.conn_type or (conn.conn_type == "ssh" and not conn.ssh_host):
+        return "Error: No active connection to reboot."
+    is_ssh = conn.conn_type == "ssh"
+
+    # Fire the reboot command without waiting for its (impossible) response.
+    try:
+        if is_ssh:
+            # nohup + & so the channel closing doesn't abort the reboot itself.
+            conn.ssh_client.exec_command("nohup sh -c 'sleep 1; reboot' >/dev/null 2>&1 &", timeout=5)
+        else:
+            conn.serial_client.write(b"reboot\r\n")
+        DEVICE_MANAGER.on_output("\n--- Reboot issued. Waiting for device to come back... ---\n", session_id)
+    except Exception as e:
+        # The command often raises as the connection drops; that is expected.
+        DEVICE_MANAGER.on_output(f"\n[reboot] connection dropped as expected: {e}\n", session_id)
+
+    if not is_ssh:
+        # Serial devices need manual reconnection; we can't auto-detect boot completion.
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return "Reboot issued on serial device. The serial link dropped; reconnect manually once the board finishes booting, then continue."
+
+    # SSH: poll and reconnect using stored credentials.
+    DEVICE_MANAGER.on_state_change("Reconnecting...", session_id)
+    ok = DEVICE_MANAGER.reconnect(session_id=session_id, timeout=wait_seconds, poll_interval=5.0)
+    DEVICE_MANAGER.on_state_change("Executing...", session_id)
+    if ok:
+        # Quick sanity probe to confirm the host is actually responsive.
+        try:
+            result = DEVICE_MANAGER.execute("echo alive; uptime", session_id=session_id)
+            return f"Device rebooted and reconnected successfully. Host is back online.\n{result}"
+        except Exception as e:
+            return f"Device reconnected but the sanity probe failed: {e}"
+    return f"Error: Device did not come back online within {wait_seconds} seconds. Check it manually."
+
+# ---------------------------------------------------------------------------
+# Industrial protocol tools: SNMP, Modbus, Redfish, IPMI.
+# These query devices that have NO shell at all -- network gear, PLCs, BMCs.
+# ---------------------------------------------------------------------------
+
+from industrial import SnmpClient, ModbusClient, RedfishClient, IpmiClient
+
+# Per-session industrial clients (lazily created, reused across calls).
+_industrial_clients = {}  # session_id -> {"snmp":..., "modbus":..., ...}
+
+
+def _get_industrial(session_id, kind, factory):
+    """Get-or-create an industrial client of `kind` for a session."""
+    bucket = _industrial_clients.setdefault(session_id, {})
+    if kind not in bucket:
+        bucket[kind] = factory()
+    return bucket[kind]
+
+
+@tool
+def snmp_query(host: str, oid_or_name: str, operation: str = "get",
+               community: str = "public", port: int = 161, version: int = 2,
+               config: RunnableConfig = None) -> str:
+    """
+    Query a network device (switch, router, PDU, UPS, AP) via SNMP. Use this for
+    devices that have no shell -- they expose status only through SNMP OIDs.
+
+    Args:
+        host: IP/hostname of the SNMP-enabled device.
+        oid_or_name: An OID (e.g. '1.3.6.1.2.1.1.1.0') or a known name like
+            'sysDescr', 'sysUpTime', 'ifNumber', 'ifOperStatus', 'ifInOctets'.
+        operation: 'get' for a single scalar value, or 'walk' for a table subtree.
+        community: SNMP community string (default 'public').
+        port: SNMP UDP port (default 161).
+        version: 1 or 2 (default 2 = SNMPv2c).
+    """
+    session_id = (config or {}).get("configurable", {}).get("session_id")
+    try:
+        client = _get_industrial(session_id, "snmp", lambda: SnmpClient(host, community, port, version))
+        if operation == "walk":
+            return client.walk(oid_or_name)
+        return client.get(oid_or_name)
+    except Exception as e:
+        return f"Error: SNMP query failed: {e}"
+
+
+@tool
+def modbus_query(host: str, operation: str, address: int, value=None,
+                 count: int = 1, port: int = 502, unit_id: int = 1,
+                 config: RunnableConfig = None) -> str:
+    """
+    Read or write a Modbus TCP device (PLC, sensor, energy meter, drive).
+    Use this for industrial equipment that speaks Modbus and has no shell.
+
+    Args:
+        host: IP/hostname of the Modbus TCP device.
+        operation: One of 'read_holding_registers', 'read_coils', 'write_register', 'write_coil'.
+        address: Starting register/coil address (0-based).
+        value: Required for write operations (register value as int, or 0/1 for coil).
+        count: Number of registers/coils to read (default 1, ignored for writes).
+        port: Modbus TCP port (default 502).
+        unit_id: Modbus slave/unit ID (default 1).
+    """
+    session_id = (config or {}).get("configurable", {}).get("session_id")
+    try:
+        client = _get_industrial(session_id, "modbus", lambda: ModbusClient(host, port, unit_id))
+        if operation == "read_holding_registers":
+            return client.read_holding_registers(address, count)
+        elif operation == "read_coils":
+            return client.read_coils(address, count)
+        elif operation == "write_register":
+            if value is None:
+                return "Error: write_register requires a 'value' argument."
+            return client.write_register(address, value)
+        elif operation == "write_coil":
+            return client.write_coil(address, bool(value))
+        else:
+            return f"Error: Unknown modbus operation '{operation}'. Use read_holding_registers, read_coils, write_register, or write_coil."
+    except Exception as e:
+        return f"Error: Modbus operation failed: {e}"
+
+
+@tool
+def redfish_query(host: str, username: str, password: str, path: str = "",
+                  port: int = 443, use_https: bool = True,
+                  config: RunnableConfig = None) -> str:
+    """
+    Query a server BMC via the Redfish REST API (DMTF). Use this for out-of-band
+    server management -- power state, sensors, firmware, inventory, event logs.
+    Common paths: 'Systems', 'Chassis', 'Managers', 'Chassis/1/Thermal',
+    'Systems/1'. Leave path empty to get the service root for discovery.
+
+    Args:
+        host: IP/hostname of the BMC.
+        username: BMC username (e.g. 'root', 'admin').
+        password: BMC password.
+        path: Redfish resource path relative to /redfish/v1/ (or a full /redfish/ path).
+        port: BMC HTTPS port (default 443, sometimes 443 on iLO / 5900 on others).
+        use_https: Use HTTPS (default true). Set false for insecure/dev BMCs.
+    """
+    session_id = (config or {}).get("configurable", {}).get("session_id")
+    try:
+        client = _get_industrial(
+            session_id, "redfish",
+            lambda: RedfishClient(host, username, password, port, use_https),
+        )
+        if not path:
+            return client.root()
+        return client.get(path)
+    except Exception as e:
+        return f"Error: Redfish query failed: {e}"
+
+
+@tool
+def ipmi_query(host: str, username: str, password: str, operation: str = "power",
+               port: int = 623, config: RunnableConfig = None) -> str:
+    """
+    Query a server BMC via IPMI 2.0 (RMCP+ LAN). Use this for older servers whose
+    BMC does not support Redfish, or when Redfish is not available.
+
+    Args:
+        host: IP/hostname of the BMC.
+        username: BMC username.
+        password: BMC password.
+        operation: One of 'power' (power state), 'sensors' (temperature/voltage/fan
+            readings), 'sel' (system event log), 'inventory' (hardware identity).
+        port: IPMI RMCP+ port (default 623).
+    """
+    session_id = (config or {}).get("configurable", {}).get("session_id")
+    try:
+        client = _get_industrial(
+            session_id, "ipmi",
+            lambda: IpmiClient(host, username, password, port),
+        )
+        if operation == "power":
+            return client.get_power_state()
+        elif operation == "sensors":
+            return client.get_sensors()
+        elif operation == "sel":
+            return client.get_sel()
+        elif operation == "inventory":
+            return client.get_identify()
+        else:
+            return f"Error: Unknown ipmi operation '{operation}'. Use power, sensors, sel, or inventory."
+    except Exception as e:
+        return f"Error: IPMI query failed: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Batch orchestration: run a command across a group of devices concurrently.
+# ---------------------------------------------------------------------------
+
+from device_groups import GROUP_MANAGER
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import traceback
+
+
+def _run_on_one_device(spec: dict, command: str) -> dict:
+    """Open a throwaway SSH connection, run a command, return the result.
+    Does NOT use the session-bound ConnectionManager -- batch ops are independent
+    so they can fan out without colliding with an active session's connection."""
+    host = spec.get("host")
+    result = {"host": host, "status": "error", "output": "", "exit_status": None}
+    if not host:
+        result["output"] = "No host specified."
+        return result
+    if spec.get("conn_type", "ssh") != "ssh":
+        result["output"] = f"Batch execution only supports SSH; {host} is {spec.get('conn_type')}."
+        return result
+    password = spec.get("password")
+    # If no stored secret, try the username/password passed inline.
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            hostname=host,
+            port=spec.get("port", 22),
+            username=spec.get("username", "root"),
+            password=password,
+            timeout=10,
+        )
+        try:
+            stdin, stdout, stderr = client.exec_command(command, get_pty=True, timeout=120)
+            output = stdout.read().decode("utf-8", errors="replace")
+            exit_status = stdout.channel.recv_exit_status()
+            err = stderr.read().decode("utf-8", errors="replace")
+            if err:
+                output += "\n[stderr]\n" + err
+            result["status"] = "success" if exit_status == 0 else "failed"
+            result["exit_status"] = exit_status
+            result["output"] = output.strip()[:2000]  # cap per-device output
+        finally:
+            client.close()
+    except Exception as e:
+        result["output"] = f"Connection error: {e}"
+    return result
+
+
+@tool
+def batch_run(group_id: str, command: str, batch_size: int = 10,
+              max_failure_pct: int = 20, config: RunnableConfig = None) -> str:
+    """
+    Run a shell command across ALL devices in a device group, concurrently. Use
+    this for fleet-wide operations like kernel upgrades, config changes, or bulk
+    diagnostics. Results from every device are collected and returned.
+
+    Rolling/batch mode: devices are processed in waves of `batch_size`. If the
+    failure rate exceeds `max_failure_pct`, execution HALTS to prevent a bad
+    change from spreading to the remaining devices (fail-fast protection).
+
+    Args:
+        group_id: The device group ID (from list_device_groups). The group must
+            exist and its devices must have SSH credentials stored in the vault.
+        command: The shell command to run on every device.
+        batch_size: How many devices to run concurrently in one wave (default 10).
+        max_failure_pct: Stop the whole rollout if more than this percent of
+            devices in a wave fail (default 20). Set to 100 to disable fail-fast.
+    """
+    session_id = (config or {}).get("configurable", {}).get("session_id")
+    group = GROUP_MANAGER.get(group_id)
+    if not group:
+        return f"Error: Device group '{group_id}' not found. Use list_device_groups to see available groups."
+
+    specs = GROUP_MANAGER.resolve_credentials(group)
+    # Filter to devices that actually have resolvable credentials.
+    ready = [s for s in specs if s.get("username")]
+    missing = [s["host"] for s in specs if not s.get("username")]
+    if not ready:
+        return f"Error: No devices in group '{group.name}' have resolvable SSH credentials. Store credentials first via the vault."
+
+    # Audit the batch operation.
+    audit.record(session_id=session_id, device=f"batch:{group.name}",
+                 command=f"<batch_run {command[:80]} on {len(ready)} devices>", source="agent")
+
+    all_results = []
+    aborted = False
+    total_done = 0
+
+    # Process in waves of batch_size.
+    for wave_start in range(0, len(ready), batch_size):
+        wave = ready[wave_start:wave_start + batch_size]
+        wave_results = []
+        with ThreadPoolExecutor(max_workers=len(wave)) as pool:
+            futures = {pool.submit(_run_on_one_device, spec, command): spec for spec in wave}
+            for fut in as_completed(futures):
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    res = {"host": futures[fut].get("host"), "status": "error",
+                           "output": f"Exception: {e}", "exit_status": None}
+                wave_results.append(res)
+
+        all_results.extend(wave_results)
+        total_done += len(wave_results)
+
+        # Fail-fast: check failure rate within this wave.
+        failures = sum(1 for r in wave_results if r["status"] != "success")
+        failure_rate = (failures / len(wave_results) * 100) if wave_results else 0
+        if failure_rate > max_failure_pct and wave_start + batch_size < len(ready):
+            aborted = True
+            remaining = len(ready) - total_done
+            break
+
+    # Build the summary report.
+    succeeded = sum(1 for r in all_results if r["status"] == "success")
+    failed = sum(1 for r in all_results if r["status"] != "success")
+    lines = [f"BATCH OPERATION REPORT: '{command[:60]}'"]
+    lines.append(f"Group: {group.name} | Devices attempted: {len(all_results)}/{len(ready)}")
+    lines.append(f"Result: {succeeded} succeeded, {failed} failed")
+    if missing:
+        lines.append(f"Skipped (no credentials): {', '.join(missing)}")
+    if aborted:
+        lines.append(f"ABORTED: failure rate exceeded {max_failure_pct}% in a wave. {remaining} devices NOT touched.")
+    lines.append("")
+    for r in all_results:
+        status_icon = "OK" if r["status"] == "success" else "FAIL"
+        lines.append(f"[{status_icon}] {r['host']} (exit {r['exit_status']})")
+        if r["status"] != "success" or "error" in r.get("output", "").lower():
+            lines.append(f"     {r['output'][:200]}")
+    return "\n".join(lines)
+
+
+@tool
+def list_device_groups(config: RunnableConfig = None) -> str:
+    """
+    List all saved device groups with their IDs, names, and device counts.
+    Use this before batch_run to find the right group_id.
+    """
+    groups = GROUP_MANAGER.list()
+    if not groups:
+        return "No device groups defined yet. Create one via the web UI or POST /api/device-groups."
+    lines = ["Device Groups:"]
+    for g in groups:
+        lines.append(f"  - {g['group_id']}: '{g['name']}' ({g['device_count']} devices)")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Configuration baseline & drift detection
+# ---------------------------------------------------------------------------
+
+from baseline import BASELINE_MANAGER, DEFAULT_PROBES
+
+
+@tool
+def snapshot_config(config: RunnableConfig = None,
+                    probes: str = "") -> str:
+    """
+    Capture a configuration snapshot of the connected device right now. This
+    records ip addr, iptables, routes, mounts, running services, and key config
+    files so that future changes can be detected by diffing against this baseline.
+
+    Use this when you want to establish a known-good baseline BEFORE making
+    changes, or to capture the current state for later comparison. Call
+    diff_config afterwards to see what changed.
+
+    Args:
+        probes: Optional comma-separated list of specific probes to run instead
+            of the default set (e.g. 'ip_addr,iptables'). Leave empty for all.
+    """
+    session_id = (config or {}).get("configurable", {}).get("session_id")
+    conn = DEVICE_MANAGER.get_connection(session_id)
+    if not conn.conn_type:
+        return "Error: No active connection. Connect to a device first."
+
+    device_key = DEVICE_MANAGER.get_device_key(session_id)
+    if not device_key:
+        return "Error: Could not determine device key for snapshot."
+
+    # Decide which probes to run.
+    if probes.strip():
+        requested = [p.strip() for p in probes.split(",")]
+        probe_map = {k: v for k, v in DEFAULT_PROBES.items() if k in requested}
+        if not probe_map:
+            return f"Error: Unknown probe names. Available: {', '.join(DEFAULT_PROBES.keys())}"
+    else:
+        probe_map = DEFAULT_PROBES
+
+    DEVICE_MANAGER.on_output(f"\n--- Capturing config snapshot ({len(probe_map)} probes)... ---\n", session_id)
+
+    results = {}
+    for name, cmd in probe_map.items():
+        try:
+            DEVICE_MANAGER.on_output(f"  probing {name}...", session_id)
+            output = DEVICE_MANAGER.execute(cmd, session_id=session_id)
+            # Strip the wrapper lines added by execute() for cleaner storage.
+            lines = output.split("\n")
+            cleaned = []
+            capture = False
+            for line in lines:
+                if line.startswith("OUTPUT:"):
+                    capture = True
+                    continue
+                if line.startswith("--- Command Finished ---") or line.startswith("Exit Status:"):
+                    capture = False
+                    continue
+                if capture:
+                    cleaned.append(line)
+            results[name] = "\n".join(cleaned).strip()[:5000]
+        except Exception as e:
+            results[name] = f"<error: {e}>"
+
+    snapshot = BASELINE_MANAGER.save_snapshot(device_key, results)
+    audit.record(
+        session_id=session_id, device=f"ssh:{device_key}",
+        command=f"<snapshot_config {len(results)} probes>", exit_status=0, source="agent",
+    )
+    return (f"Snapshot saved for {device_key} at {snapshot['datetime']}.\n"
+            f"Captured {len(results)} config areas: {', '.join(results.keys())}.\n"
+            f"Use diff_config later to see what changed since this snapshot.")
+
+
+@tool
+def diff_config(config: RunnableConfig = None,
+                older_timestamp: str = "",
+                newer_timestamp: str = "") -> str:
+    """
+    Compare two configuration snapshots of the connected device to detect drift.
+    By default, compares the latest snapshot against the one before it. Use this
+    to answer "what changed on this device?" -- e.g. after a network outage, to
+    see if iptables or routing was modified.
+
+    Args:
+        older_timestamp: Timestamp of the older snapshot to compare from (YYYYMMDD_HHMMSS).
+            Leave empty to auto-use the second-newest snapshot.
+        newer_timestamp: Timestamp of the newer snapshot to compare to. Leave empty
+            to auto-use the newest snapshot.
+    """
+    session_id = (config or {}).get("configurable", {}).get("session_id")
+    device_key = DEVICE_MANAGER.get_device_key(session_id)
+    if not device_key:
+        return "Error: Could not determine device key."
+
+    snaps = BASELINE_MANAGER.list_snapshots(device_key)
+    if len(snaps) < 2:
+        return (f"Only {len(snaps)} snapshot(s) exist for {device_key}. "
+                "Need at least 2 to diff. Call snapshot_config again after making changes.")
+
+    diff_result = BASELINE_MANAGER.diff(
+        device_key,
+        newer_ts=newer_timestamp or None,
+        older_ts=older_timestamp or None,
+    )
+    if not diff_result:
+        return "Error: Could not compute diff (snapshots may be missing)."
+
+    return BASELINE_MANAGER.format_diff(diff_result)
+
+
+@tool
+def list_snapshots(config: RunnableConfig = None) -> str:
+    """
+    List all configuration snapshots for the connected device with timestamps
+    and which config areas were captured. Use this before diff_config to pick
+    specific timestamps, or just to see the snapshot history.
+    """
+    session_id = (config or {}).get("configurable", {}).get("session_id")
+    device_key = DEVICE_MANAGER.get_device_key(session_id)
+    if not device_key:
+        return "Error: Could not determine device key."
+
+    snaps = BASELINE_MANAGER.list_snapshots(device_key)
+    if not snaps:
+        return f"No snapshots exist for {device_key}. Call snapshot_config to capture one."
+    lines = [f"Snapshots for {device_key}:"]
+    for s in snaps:
+        lines.append(f"  {s['timestamp']} ({s['datetime']}) -- {s['probe_count']} probes: {', '.join(s['probe_names'][:5])}")
+    return "\n".join(lines)

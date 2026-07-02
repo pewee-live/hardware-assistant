@@ -70,10 +70,13 @@
             
             <div class="chat-input-area glass-panel">
                 <form id="chat-form" style="display: flex; gap: 0.5rem; width: 100%;">
+                    <input type="file" id="file-input" style="display:none;" multiple>
+                    <button type="button" id="upload-btn" class="icon-btn" title="Upload file to device" disabled>⤴</button>
                     <input type="text" id="chat-input" placeholder="Describe your hardware issue..." autocomplete="off" disabled>
                     <button type="submit" id="send-btn" class="btn primary-btn" disabled>Send</button>
                     <button type="button" id="stop-btn" class="btn danger-btn" style="display: none; width: auto; padding: 0 1.5rem;" title="Stop Execution">■</button>
                 </form>
+                <div id="upload-hint" class="upload-hint" style="display:none;"></div>
             </div>
         </main>
     </div>

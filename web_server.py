@@ -8,8 +8,9 @@ from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
+from fastapi import UploadFile, File as FastAPIFile
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -29,6 +30,10 @@ CURRENCY = os.getenv("COST_CURRENCY", "USD")
 
 
 from tools import DEVICE_MANAGER, DEVICE_PROFILE_MANAGER
+from vault import VAULT
+import audit
+from device_groups import GROUP_MANAGER
+from baseline import BASELINE_MANAGER
 
 
 def clean_message_history(messages):
@@ -335,6 +340,29 @@ def startup_event():
         print(f"Agent failed to build: {e}")
 
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Graceful shutdown: cancel every running agent task and give each a chance
+    to persist its messages (their CancelledError path calls _persist_session)
+    before the process exits. Without this, a Docker `stop` (SIGTERM) or Ctrl+C
+    would drop whatever was in-flight."""
+    print("[shutdown] flushing in-flight agent sessions...")
+    tasks = list(active_agent_tasks.items())
+    for session_id, task in tasks:
+        if not task.done():
+            task.cancel()
+    # Let each cancelled task reach its persistence path before we exit.
+    if tasks:
+        await asyncio.gather(
+            *(t for _, t in tasks if not t.done()),
+            return_exceptions=True,
+        )
+    # Belt-and-suspenders: ensure every active session's latest messages are saved.
+    for session_id, messages in list(active_sessions.items()):
+        _persist_session(session_id, messages)
+    print("[shutdown] all sessions persisted.")
+
+
 @app.get("/api/sessions")
 async def list_sessions():
     sessions = SESSION_MANAGER.list_sessions()
@@ -530,6 +558,12 @@ async def get_status(session_id: Optional[str] = None):
     return status
 
 
+@app.get("/api/health")
+async def health():
+    """Liveness/readiness probe for container orchestrators & reverse proxies."""
+    return {"status": "ok", "agent_ready": agent_app is not None}
+
+
 @app.post("/api/connect")
 async def connect(req: ConnectRequest):
     global active_session_id
@@ -557,6 +591,11 @@ async def connect(req: ConnectRequest):
         active_session_id = req.session_id
         return {"status": "success", "message": msg}
     except Exception as e:
+        audit.record(
+            session_id=req.session_id,
+            device=f"{req.conn_type}:{req.host or req.serial_port}",
+            command=f"<connect failed>", exit_status=1, source="ui", detail=str(e)[:200],
+        )
         return {"status": "error", "message": str(e)}
 
 
@@ -571,6 +610,7 @@ async def disconnect_hardware(session_id: Optional[str] = None):
         DEVICE_MANAGER.disconnect(session_id=sid)
         if active_session_id == sid:
             active_session_id = None
+        audit.record(session_id=sid, device="*", command="<disconnect>", source="ui")
         return {"status": "success", "message": "Disconnected"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -580,6 +620,34 @@ async def disconnect_hardware(session_id: Optional[str] = None):
 async def list_devices():
     """List all known device profiles (memory)."""
     return {"status": "success", "devices": DEVICE_PROFILE_MANAGER.list_profiles()}
+
+
+# --- File upload (staging area for the agent's upload_file tool) ---
+# Files uploaded via the UI land in data/uploads/<session_id>/ so the agent can
+# reference them by a stable local path when calling the upload_file tool.
+UPLOAD_DIR = os.path.join("data", "uploads")
+
+
+@app.post("/api/sessions/{session_id}/upload")
+async def upload_session_file(session_id: str, file: UploadFile = FastAPIFile(...)):
+    dest_dir = os.path.join(UPLOAD_DIR, session_id)
+    os.makedirs(dest_dir, exist_ok=True)
+    safe_name = os.path.basename(file.filename or "upload.bin")
+    dest = os.path.join(dest_dir, safe_name)
+    with open(dest, "wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+    abs_dest = os.path.abspath(dest)
+    return JSONResponse({
+        "status": "success",
+        "local_path": abs_dest,
+        "filename": safe_name,
+        "size": os.path.getsize(abs_dest),
+        "hint": f"File staged. Tell the agent to upload it with: upload_file(local_path='{abs_dest}', remote_path='/path/on/device').",
+    })
 
 
 class DeviceProfileUpdate(BaseModel):
@@ -594,6 +662,121 @@ async def update_device_notes(req: DeviceProfileUpdate):
     if profile:
         return {"status": "success", "profile": profile}
     return {"status": "error", "message": "Could not update device profile"}
+
+
+# --- Credential vault + audit log ---
+
+class VaultEntry(BaseModel):
+    device_key: str
+    conn_type: str = "ssh"
+    host: Optional[str] = None
+    username: Optional[str] = None
+    port: Optional[int] = 22
+    secret: Optional[str] = None
+
+
+@app.get("/api/vault/devices")
+async def list_vault():
+    return {"status": "success", "devices": VAULT.list()}
+
+
+@app.post("/api/vault/devices")
+async def store_vault(req: VaultEntry):
+    params = {"host": req.host or req.device_key, "username": req.username, "port": req.port or 22}
+    entry = VAULT.store(req.device_key, req.conn_type, params, req.secret)
+    return {"status": "success", "entry": entry}
+
+
+@app.delete("/api/vault/devices/{device_key}")
+async def delete_vault(device_key: str):
+    removed = VAULT.delete(device_key)
+    return {"status": "success" if removed else "error", "removed": removed}
+
+
+@app.get("/api/audit")
+async def get_audit(
+    session_id: Optional[str] = None,
+    device: Optional[str] = None,
+    source: Optional[str] = None,
+    limit: int = 200,
+):
+   records = audit.query(session_id=session_id, device=device, source=source, limit=min(limit, 1000))
+   return {"status": "success", "records": records, "count": len(records)}
+
+
+# --- Device groups (batch orchestration) ---
+
+class DeviceTargetModel(BaseModel):
+    host: str
+    conn_type: str = "ssh"
+    username: Optional[str] = "root"
+    port: int = 22
+
+
+class CreateGroupRequest(BaseModel):
+    name: str
+    targets: list[DeviceTargetModel] = []
+
+
+class AddDeviceRequest(BaseModel):
+    host: str
+    conn_type: str = "ssh"
+    username: Optional[str] = "root"
+    port: int = 22
+
+
+@app.get("/api/device-groups")
+async def list_groups():
+    return {"status": "success", "groups": GROUP_MANAGER.list()}
+
+
+@app.post("/api/device-groups")
+async def create_group(req: CreateGroupRequest):
+    targets = [t.model_dump() for t in req.targets]
+    group = GROUP_MANAGER.create(req.name, targets)
+    return {"status": "success", "group": group.to_dict()}
+
+
+@app.get("/api/device-groups/{group_id}")
+async def get_group(group_id: str):
+    group = GROUP_MANAGER.get(group_id)
+    if not group:
+        return {"status": "error", "message": "Group not found"}
+    return {"status": "success", "group": group.to_dict()}
+
+
+@app.post("/api/device-groups/{group_id}/devices")
+async def add_device_to_group(group_id: str, req: AddDeviceRequest):
+    group = GROUP_MANAGER.add_device(group_id, req.model_dump())
+    if not group:
+        return {"status": "error", "message": "Group not found"}
+    return {"status": "success", "group": group.to_dict()}
+
+
+@app.delete("/api/device-groups/{group_id}")
+async def delete_group(group_id: str):
+    removed = GROUP_MANAGER.delete(group_id)
+    return {"status": "success" if removed else "error", "removed": removed}
+
+
+# --- Configuration baselines & drift ---
+
+@app.get("/api/baselines/{device_key}")
+async def list_baselines(device_key: str):
+    """List all config snapshots for a device."""
+    return {"status": "success", "snapshots": BASELINE_MANAGER.list_snapshots(device_key)}
+
+
+@app.get("/api/baselines/{device_key}/diff")
+async def get_baseline_diff(device_key: str, older: str = "", newer: str = ""):
+    """Get the drift diff between two snapshots of a device."""
+    snaps = BASELINE_MANAGER.list_snapshots(device_key)
+    if len(snaps) < 2:
+        return {"status": "error", "message": "Need at least 2 snapshots to diff."}
+    diff = BASELINE_MANAGER.diff(device_key, newer_ts=newer or None, older_ts=older or None)
+    if not diff:
+        return {"status": "error", "message": "Could not compute diff."}
+    return {"status": "success", "diff": diff, "text": BASELINE_MANAGER.format_diff(diff)}
 
 
 @app.post("/api/password")
@@ -850,6 +1033,10 @@ async def run_agent_workflow(session_id: str, messages: list):
             },
         }
         await broadcast(session_id, {"type": "status", "content": "Thinking..."})
+        _last_persist_msg_count = len(messages)
+        # Persist at most once per this many new messages, so a crash mid-run
+        # loses only the last second of work rather than the whole turn.
+        _PERSIST_EVERY_N_MSGS = 2
         async for event in agent_app.astream({"messages": messages}, config=config):
             for node_name, node_state in event.items():
                 if node_name == "agent":
@@ -868,8 +1055,20 @@ async def run_agent_workflow(session_id: str, messages: list):
                 else:
                     messages.append(new_msgs)
 
+                # Incremental checkpoint: persist periodically so a server crash
+                # never wipes a whole turn's worth of executed commands/output.
+                if len(messages) - _last_persist_msg_count >= _PERSIST_EVERY_N_MSGS:
+                    _persist_session(session_id, messages)
+                    _last_persist_msg_count = len(messages)
+
+        # Final flush of any messages added since the last checkpoint.
+        if len(messages) != _last_persist_msg_count:
+            _persist_session(session_id, messages)
         await broadcast(session_id, {"type": "status", "content": "Ready"})
-        _persist_session(session_id, messages)
+        # Notify any attached viewer (and buffer it for late viewers) that the
+        # run finished -- the UI uses this to fire a browser notification/sound,
+        # especially when the user has switched to another tab.
+        await broadcast(session_id, {"type": "run_done", "session_id": session_id})
         # History is now durably saved; clear the live replay buffer.
         session_events.setdefault(session_id, []).clear()
     except asyncio.CancelledError:
@@ -970,6 +1169,10 @@ async def websocket_endpoint(ws: WebSocket, session_id: str = Query(...)):
                     SESSION_MANAGER.save_session(session_id, data_sess)
 
             messages.append(HumanMessage(content=data))
+            # Persist the user's message immediately, before the (possibly long)
+            # agent run starts. If the run crashes or the server dies, we still
+            # know what the user asked.
+            _persist_session(session_id, messages)
             await broadcast(session_id, {"type": "user_message", "content": data})
             await broadcast(session_id, {"type": "status", "content": "Thinking..."})
 
