@@ -55,3 +55,8 @@ Thumbs.db
 
 # Log files
 *.log
+
+# Runtime data (sessions, device profiles, vault, baselines, audit, uploads,
+# device groups) -- contains sensitive credentials and user-specific state.
+data/
+!data/.gitkeep
